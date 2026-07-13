@@ -120,7 +120,7 @@ desarrollo). No edites a mano la lista de `dependencies` del `pyproject.toml`.
 
 ## Estado actual
 
-**Fases 1 y 2 hechas.** Implementados y cubiertos con tests:
+**Fases 1-3 hechas.** Implementados y cubiertos con tests:
 
 - `transcript.py` — parseo de VTT, deduplicación de auto-subs y detección de URLs, más el
   wrapper de descarga con yt-dlp (fase 1).
@@ -131,15 +131,27 @@ desarrollo). No edites a mano la lista de `dependencies` del `pyproject.toml`.
 - `prompts.py` — `MAP_SYSTEM` (esquema de extracción macro) y `REDUCE_SYSTEM` (informe
   final por temas), con los helpers puros `build_map_user_prompt` /
   `build_reduce_user_prompt` (fase 2).
+- `pipeline.py` — `summarize(url, client, settings, progress=None)` orquesta
+  transcripción -> troceo -> map en paralelo (semáforo de `max_concurrency`) -> reduce, y
+  devuelve `SummaryResult` con el uso de tokens desglosado map/reduce/total (fase 3).
+- `config.py` — completo salvo `get_settings` (lo cableará el bot en la fase 4).
 
-Siguen como stubs (`raise NotImplementedError`): `config.py` (solo `sub_lang_list` y
-`get_settings`), `whisper.py`, `pipeline.py` y `bot.py`.
+Siguen como stubs (`raise NotImplementedError`): `whisper.py` y `bot.py`.
 
-Contratos que la fase 3 debe respetar al cablear el pipeline:
+**DECISIÓN vigente: sin plan B de Whisper.** El pipeline NO cae a `whisper.py`; un vídeo
+sin subtítulos propaga `NoSubtitlesError` y es el bot quien debe explicárselo al usuario.
+Si algún día se activa el plan B, el sitio es `pipeline.summarize` (capturar
+`NoSubtitlesError` y llamar a `whisper.get_transcript_via_whisper`).
 
-- `OpenRouterClient(settings)` toma `Settings` (la key nunca sale de `os.environ`), se usa
-  como async context manager y `complete(system, user, *, model=...)` recibe el modelo por
-  parámetro: `llm.py` no conoce `MAP_MODEL`/`REDUCE_MODEL`.
+Contratos que la fase 4 (bot) debe respetar:
+
+- `pipeline.summarize` recibe el `OpenRouterClient` ya construido (una instancia por
+  proceso, como async context manager) y unos `Settings`; el `progress` opcional acepta
+  callback síncrono o asíncrono y recibe mensajes en español listos para enseñar.
+- Errores a traducir para el usuario: `NoSubtitlesError` (vídeo sin subtítulos),
+  `TranscriptError` (vídeo privado/borrado), `LLMError` y subclases (fallo con
+  OpenRouter). El pipeline nunca devuelve un informe parcial: si un bloque map falla,
+  propaga.
 - La salida de cada map empieza con el rango temporal del bloque (lo exige `MAP_SYSTEM` y
   lo inyecta `build_map_user_prompt`): así el reduce recibe las marcas de tiempo sin
   cableado extra, y de ahí sale el "Recorrido por bloques" del informe.

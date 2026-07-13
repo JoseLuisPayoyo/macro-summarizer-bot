@@ -34,12 +34,13 @@ class Settings(BaseSettings):
     # --- Comportamiento del resumen ---
     summary_lang: str = "es"
     chunk_minutes: int = 10
+    max_concurrency: int = 5  # llamadas map simultáneas contra OpenRouter
     sub_langs: str = "en,en-US,en-GB"
 
     @property
     def sub_lang_list(self) -> list[str]:
         """`sub_langs` como lista de códigos de idioma, en orden de preferencia."""
-        raise NotImplementedError
+        return [lang.strip() for lang in self.sub_langs.split(",") if lang.strip()]
 
 
 @lru_cache(maxsize=1)
