@@ -27,6 +27,9 @@ htmlcov/
 *.mp3
 tmp/
 
+# ...pero los VTT de prueba sí forman parte del repo
+!tests/fixtures/*.vtt
+
 # Editores / SO
 .idea/
 .vscode/

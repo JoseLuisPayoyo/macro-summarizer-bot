@@ -120,7 +120,47 @@ desarrollo). No edites a mano la lista de `dependencies` del `pyproject.toml`.
 
 ## Estado actual
 
-**Andamiaje.** Los módulos tienen sus docstrings y las firmas previstas, pero el cuerpo de
-las funciones es `raise NotImplementedError`. Los tests actuales fijan ese contrato (y
-llevan `TODO` señalando los casos reales que deben sustituirlos); al implementar un módulo,
-reemplaza sus tests `*_not_implemented_yet` por pruebas de verdad.
+**Fase 1 hecha: el núcleo puro.** Implementados y cubiertos con tests:
+
+- `transcript.py` — parseo de VTT, deduplicación de auto-subs y detección de URLs, más el
+  wrapper de descarga con yt-dlp.
+- `chunking.py` — troceo por ventanas de tiempo.
+
+Siguen como stubs (`raise NotImplementedError`): `config.py` (solo `sub_lang_list` y
+`get_settings`), `llm.py`, `whisper.py`, `prompts.py` (los prompts sí están escritos; falta
+montar los mensajes de usuario), `pipeline.py` y `bot.py`.
+
+## Cómo se prueba
+
+La regla que ordena el módulo `transcript`: **la lógica delicada es pura y la I/O es una
+capa fina encima**. `parse_vtt`, `find_youtube_url`, `extract_video_id` y todo `chunking`
+son funciones puras y están al 100% de cobertura; `fetch_subtitles` (que es quien llama a
+yt-dlp) no se cubre con unitarios.
+
+- **Ningún test unitario toca la red.** El único que lo haría lleva `@pytest.mark.integration`
+  y se salta salvo que se ejecute con `MACROBOT_INTEGRATION=1`.
+- Los VTT de prueba están en `tests/fixtures/*.vtt` como ficheros de verdad, no como
+  literales de Python: los auto-subs de YouTube contienen líneas que son un espacio suelto
+  dentro del cue, y eso no sobrevive a un literal ni al formateador. El parser depende de
+  ese detalle, así que el fixture tiene que ser fiel al byte.
+
+```bash
+uv run pytest                                    # unitarios (los de red se saltan)
+uv run pytest --cov=macrobot --cov-report=term-missing
+MACROBOT_INTEGRATION=1 uv run pytest -m integration   # el que sí descarga de YouTube
+```
+
+### Deduplicación de los subtítulos automáticos
+
+Es la pieza con más trampa del repo. Los auto-subs de YouTube usan una **ventana rodante**:
+la pantalla muestra dos líneas y cada cue reemite lo que ya se veía añadiendo un par de
+palabras, con cues intermedios de ~10 ms idénticos al anterior. Reconstruir el texto es
+quitar el solapamiento entre cada cue y el anterior (`transcript._new_words`), y hay que
+hacerlo palabra a palabra: cuando la ventana pasa de página, el solapamiento no es ni todo
+el cue anterior ni todo el nuevo.
+
+El umbral `_MIN_ROLLING_OVERLAP = 2` no es arbitrario: que dos cues consecutivos compartan
+**una** palabra en la frontera pasa constantemente en subtítulos manuales ("...lo llamo
+crecimiento" / "crecimiento es lo que importa") y ahí las dos son buenas. A partir de dos
+palabras seguidas ya no es casualidad. Si tocas esto, el test que lo vigila es
+`test_parse_vtt_keeps_a_repeated_word_that_is_not_a_rolling_overlap`.
