@@ -1,6 +1,8 @@
-"""Tests de `macrobot.config`: lo que el pipeline consume de la configuración."""
+"""Tests de `macrobot.config`: lo que el pipeline y el bot consumen de la configuración."""
 
-from macrobot.config import Settings
+import pytest
+
+from macrobot.config import Settings, get_settings
 
 
 def make_settings(**overrides) -> Settings:
@@ -27,3 +29,35 @@ def test_max_concurrency_defaults_to_five():
 
 def test_max_concurrency_can_be_overridden():
     assert make_settings(max_concurrency=2).max_concurrency == 2
+
+
+def test_prices_are_unset_by_default():
+    settings = make_settings()
+
+    assert settings.map_input_usd_per_mtok is None
+    assert settings.reduce_output_usd_per_mtok is None
+
+
+@pytest.fixture
+def fresh_settings_cache():
+    """Vacía la caché de `get_settings` antes y después, para no contaminar otros tests."""
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def test_get_settings_reads_the_environment(monkeypatch, fresh_settings_cache):
+    monkeypatch.setenv("TELEGRAM_TOKEN", "token-del-entorno")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "key-del-entorno")
+
+    settings = get_settings()
+
+    assert settings.telegram_token == "token-del-entorno"
+    assert settings.openrouter_api_key == "key-del-entorno"
+
+
+def test_get_settings_returns_the_same_cached_instance(monkeypatch, fresh_settings_cache):
+    monkeypatch.setenv("TELEGRAM_TOKEN", "t")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+
+    assert get_settings() is get_settings()

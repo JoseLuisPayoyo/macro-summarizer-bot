@@ -120,7 +120,8 @@ desarrollo). No edites a mano la lista de `dependencies` del `pyproject.toml`.
 
 ## Estado actual
 
-**Fases 1-3 hechas.** Implementados y cubiertos con tests:
+**Fases 1-4 hechas: el bot es funcional de punta a punta** (para vídeos con subtítulos).
+Implementados y cubiertos con tests:
 
 - `transcript.py` — parseo de VTT, deduplicación de auto-subs y detección de URLs, más el
   wrapper de descarga con yt-dlp (fase 1).
@@ -134,24 +135,35 @@ desarrollo). No edites a mano la lista de `dependencies` del `pyproject.toml`.
 - `pipeline.py` — `summarize(url, client, settings, progress=None)` orquesta
   transcripción -> troceo -> map en paralelo (semáforo de `max_concurrency`) -> reduce, y
   devuelve `SummaryResult` con el uso de tokens desglosado map/reduce/total (fase 3).
-- `config.py` — completo salvo `get_settings` (lo cableará el bot en la fase 4).
+- `config.py` — completo, incluido `get_settings()` (única instancia, con `lru_cache`).
+- `bot.py` — la aplicación de python-telegram-bot en polling y el entry point
+  `uv run macrobot` (fase 4). La lógica pura (troceo a 4096, traducción de errores,
+  coste estimado, pie del informe) está separada de los handlers y cubierta por tests;
+  los handlers son capa fina sin cobertura unitaria, a propósito.
 
-Siguen como stubs (`raise NotImplementedError`): `whisper.py` y `bot.py`.
+Sigue como stub (`raise NotImplementedError`): `whisper.py`.
 
 **DECISIÓN vigente: sin plan B de Whisper.** El pipeline NO cae a `whisper.py`; un vídeo
-sin subtítulos propaga `NoSubtitlesError` y es el bot quien debe explicárselo al usuario.
+sin subtítulos propaga `NoSubtitlesError` y el bot responde `NO_SUBTITLES_MESSAGE`.
 Si algún día se activa el plan B, el sitio es `pipeline.summarize` (capturar
 `NoSubtitlesError` y llamar a `whisper.get_transcript_via_whisper`).
 
-Contratos que la fase 4 (bot) debe respetar:
+Decisiones de la capa de Telegram (fase 4):
 
-- `pipeline.summarize` recibe el `OpenRouterClient` ya construido (una instancia por
-  proceso, como async context manager) y unos `Settings`; el `progress` opcional acepta
-  callback síncrono o asíncrono y recibe mensajes en español listos para enseñar.
-- Errores a traducir para el usuario: `NoSubtitlesError` (vídeo sin subtítulos),
-  `TranscriptError` (vídeo privado/borrado), `LLMError` y subclases (fallo con
-  OpenRouter). El pipeline nunca devuelve un informe parcial: si un bloque map falla,
-  propaga.
+- UN mensaje de estado por vídeo, que se EDITA con cada hito del `progress`; las
+  ediciones fallidas (rate limit, texto idéntico) se ignoran con log en DEBUG — el
+  progreso es cosmético y no debe tumbar un resumen de varios minutos.
+- El informe se envía como TEXTO PLANO (sin `parse_mode`): el Markdown que genera un LLM
+  rompe el parser de entidades de Telegram con facilidad, y un informe feo es mejor que
+  un informe que no llega.
+- `split_message` corta por párrafo > línea > espacio, nunca a media palabra, y evita
+  partir bloques de código (paridad de vallas ```) mientras sea posible; la concatenación
+  de los trozos reconstruye el original byte a byte.
+- El coste del pie sale de los precios `*_USD_PER_MTOK` de `Settings` (por pata:
+  entrada/salida de map y de reduce). Sin precios configurados, el pie omite el coste:
+  nunca se inventa.
+- El `OpenRouterClient` se crea una vez en `main` y se cierra en el `post_shutdown` de la
+  `Application`; el detalle técnico de los errores va al log (`logging`), nunca al chat.
 - La salida de cada map empieza con el rango temporal del bloque (lo exige `MAP_SYSTEM` y
   lo inyecta `build_map_user_prompt`): así el reduce recibe las marcas de tiempo sin
   cableado extra, y de ahí sale el "Recorrido por bloques" del informe.

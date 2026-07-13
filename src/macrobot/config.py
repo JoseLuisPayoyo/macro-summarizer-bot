@@ -31,6 +31,14 @@ class Settings(BaseSettings):
     map_model: str = "google/gemini-2.0-flash-001"
     reduce_model: str = "anthropic/claude-sonnet-4"
 
+    # --- Precios, en USD por MILLÓN de tokens (cópialos de la ficha de cada modelo en
+    #     openrouter.ai/models). Sirven solo para el coste estimado del pie del informe:
+    #     si falta alguno, el bot omite el coste en lugar de inventarlo. ---
+    map_input_usd_per_mtok: float | None = None
+    map_output_usd_per_mtok: float | None = None
+    reduce_input_usd_per_mtok: float | None = None
+    reduce_output_usd_per_mtok: float | None = None
+
     # --- Comportamiento del resumen ---
     summary_lang: str = "es"
     chunk_minutes: int = 10
@@ -46,4 +54,4 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Devuelve la instancia única de `Settings` (cacheada durante todo el proceso)."""
-    raise NotImplementedError
+    return Settings()  # los campos obligatorios llegan del entorno o del .env
