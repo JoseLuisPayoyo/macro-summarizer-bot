@@ -120,15 +120,29 @@ desarrollo). No edites a mano la lista de `dependencies` del `pyproject.toml`.
 
 ## Estado actual
 
-**Fase 1 hecha: el núcleo puro.** Implementados y cubiertos con tests:
+**Fases 1 y 2 hechas.** Implementados y cubiertos con tests:
 
 - `transcript.py` — parseo de VTT, deduplicación de auto-subs y detección de URLs, más el
-  wrapper de descarga con yt-dlp.
-- `chunking.py` — troceo por ventanas de tiempo.
+  wrapper de descarga con yt-dlp (fase 1).
+- `chunking.py` — troceo por ventanas de tiempo (fase 1).
+- `llm.py` — cliente asíncrono de OpenRouter: reintentos con backoff+jitter solo en
+  fallos transitorios (429/5xx/transporte), respeta `Retry-After`, devuelve siempre
+  `TokenUsage`, y un único cliente sirve a las llamadas en paralelo del map (fase 2).
+- `prompts.py` — `MAP_SYSTEM` (esquema de extracción macro) y `REDUCE_SYSTEM` (informe
+  final por temas), con los helpers puros `build_map_user_prompt` /
+  `build_reduce_user_prompt` (fase 2).
 
 Siguen como stubs (`raise NotImplementedError`): `config.py` (solo `sub_lang_list` y
-`get_settings`), `llm.py`, `whisper.py`, `prompts.py` (los prompts sí están escritos; falta
-montar los mensajes de usuario), `pipeline.py` y `bot.py`.
+`get_settings`), `whisper.py`, `pipeline.py` y `bot.py`.
+
+Contratos que la fase 3 debe respetar al cablear el pipeline:
+
+- `OpenRouterClient(settings)` toma `Settings` (la key nunca sale de `os.environ`), se usa
+  como async context manager y `complete(system, user, *, model=...)` recibe el modelo por
+  parámetro: `llm.py` no conoce `MAP_MODEL`/`REDUCE_MODEL`.
+- La salida de cada map empieza con el rango temporal del bloque (lo exige `MAP_SYSTEM` y
+  lo inyecta `build_map_user_prompt`): así el reduce recibe las marcas de tiempo sin
+  cableado extra, y de ahí sale el "Recorrido por bloques" del informe.
 
 ## Cómo se prueba
 
@@ -138,7 +152,9 @@ son funciones puras y están al 100% de cobertura; `fetch_subtitles` (que es qui
 yt-dlp) no se cubre con unitarios.
 
 - **Ningún test unitario toca la red.** El único que lo haría lleva `@pytest.mark.integration`
-  y se salta salvo que se ejecute con `MACROBOT_INTEGRATION=1`.
+  y se salta salvo que se ejecute con `MACROBOT_INTEGRATION=1`. En `test_llm.py`, httpx se
+  intercepta con respx y el sleep del backoff se sustituye (`llm._sleep`) para que los
+  reintentos no duerman: si tocas los reintentos, mantén ese alias.
 - Los VTT de prueba están en `tests/fixtures/*.vtt` como ficheros de verdad, no como
   literales de Python: los auto-subs de YouTube contienen líneas que son un espacio suelto
   dentro del cue, y eso no sobrevive a un literal ni al formateador. El parser depende de
