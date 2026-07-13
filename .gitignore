@@ -1,0 +1,39 @@
+# Entorno y secretos
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tests y herramientas
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Ficheros temporales del pipeline (audio descargado para Whisper, subtítulos)
+*.vtt
+*.m4a
+*.webm
+*.mp3
+tmp/
+
+# Editores / SO
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Claude Code (artefactos locales de la herramienta, no del proyecto)
+.claude/settings.local.json
+.agents/
+skills-lock.json
