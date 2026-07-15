@@ -33,11 +33,13 @@ URL de YouTube
    ├─ 3. MAP  (pipeline.run_map + prompts.MAP_SYSTEM + llm.py)
    │     Una llamada por bloque al modelo BARATO (MAP_MODEL), en paralelo.
    │     No resume en prosa: hace extracción estructurada según un esquema macro
-   │     (tesis, datos y cifras, previsiones, riesgos, citas). Comprime y tira la paja.
+   │     (tesis, datos y cifras, previsiones, riesgos, citas), EXHAUSTIVA y sin voz
+   │     de IA: las extracciones son el cuerpo real del informe.
    │
    ├─ 4. REDUCE  (pipeline.run_reduce + prompts.REDUCE_SYSTEM + llm.py)
    │     UNA sola llamada al modelo BUENO (REDUCE_MODEL) con todas las extracciones.
-   │     Sintetiza el informe final agrupando por tema, no por bloque.
+   │     NO sintetiza el contenido: produce solo una visión general breve (resumen
+   │     ejecutivo + índice de bloques) que orienta antes de las extracciones.
    │
    └─ 5. ENTREGA  (bot.py)
          El resumen se trocea a 4096 caracteres (límite de Telegram) y se envía.
@@ -129,9 +131,12 @@ Implementados y cubiertos con tests:
 - `llm.py` — cliente asíncrono de OpenRouter: reintentos con backoff+jitter solo en
   fallos transitorios (429/5xx/transporte), respeta `Retry-After`, devuelve siempre
   `TokenUsage`, y un único cliente sirve a las llamadas en paralelo del map (fase 2).
-- `prompts.py` — `MAP_SYSTEM` (esquema de extracción macro) y `REDUCE_SYSTEM` (informe
-  final por temas), con los helpers puros `build_map_user_prompt` /
-  `build_reduce_user_prompt` (fase 2).
+- `prompts.py` — `MAP_SYSTEM` (esquema de extracción macro, EXHAUSTIVO, hasta 5 citas,
+  con prohibición explícita de relleno y "voz de IA") y `REDUCE_SYSTEM` (SOLO visión
+  general: resumen ejecutivo + índice de bloques; ya no reescribe el contenido), con los
+  helpers puros `build_map_user_prompt` / `build_reduce_user_prompt` (fase 2, revisados
+  después de la fase 4). OJO: `pipeline`/`bot` aún entregan solo la salida del reduce;
+  entregar además las extracciones como cuerpo del informe está pendiente de cablear.
 - `pipeline.py` — `summarize(url, client, settings, progress=None)` orquesta
   transcripción -> troceo -> map en paralelo (semáforo de `max_concurrency`) -> reduce, y
   devuelve `SummaryResult` con el uso de tokens desglosado map/reduce/total (fase 3).
@@ -166,7 +171,7 @@ Decisiones de la capa de Telegram (fase 4):
   `Application`; el detalle técnico de los errores va al log (`logging`), nunca al chat.
 - La salida de cada map empieza con el rango temporal del bloque (lo exige `MAP_SYSTEM` y
   lo inyecta `build_map_user_prompt`): así el reduce recibe las marcas de tiempo sin
-  cableado extra, y de ahí sale el "Recorrido por bloques" del informe.
+  cableado extra, y de ahí sale el "Índice de bloques" de la visión general.
 
 ## Cómo se prueba
 

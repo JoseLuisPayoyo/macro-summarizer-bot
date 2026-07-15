@@ -1,9 +1,10 @@
 """Tests de `macrobot.prompts`.
 
-Los prompts son texto de cara al usuario (el resumen sale de ellos), así que estos tests
-fijan su contrato: que los apartados del esquema de extracción y los encabezados del
-informe final estén todos, y que los helpers de formato —funciones puras— monten el
-mensaje de usuario sin perder nada.
+Los prompts son texto de cara al usuario (el informe sale de ellos), así que estos tests
+fijan su contrato: que los apartados del esquema de extracción estén todos, que el reduce
+sea solo una visión general breve (resumen ejecutivo + índice, sin reescribir el
+contenido), que ambos prohíban el lenguaje de relleno, y que los helpers de formato
+—funciones puras— monten el mensaje de usuario sin perder nada.
 """
 
 from macrobot.prompts import (
@@ -27,12 +28,26 @@ MAP_SECTIONS = [
 
 REDUCE_HEADINGS = [
     "## Resumen ejecutivo",
+    "## Índice de bloques",
+]
+
+# La estructura vieja del reduce (el informe temático) no debe volver: el cuerpo del
+# informe son ahora las extracciones de los bloques, y el reduce solo orienta.
+OLD_REDUCE_HEADINGS = [
     "## Tesis principales",
     "## Datos y cifras clave",
     "## Predicciones y escenarios",
     "## Implicaciones para mercados / activos",
     "## Riesgos y puntos de debate",
     "## Recorrido por bloques",
+]
+
+# Muletillas de "voz de IA" que ambos prompts deben prohibir por su nombre.
+FILLER_PHRASES = [
+    "es importante destacar",
+    "cabe señalar",
+    "en resumen",
+    "sin duda",
 ]
 
 
@@ -68,11 +83,27 @@ def test_map_system_warns_that_the_transcript_may_come_raw():
     assert "contexto" in lowered
 
 
-def test_map_system_demands_compact_output_and_omitting_empty_sections():
+def test_map_system_demands_exhaustive_output_and_omitting_empty_sections():
     lowered = MAP_SYSTEM.lower()
 
-    assert "compacta" in lowered
+    assert "exhaustivo" in lowered
+    assert "compacta" not in lowered  # la instrucción vieja de comprimir ya no existe
     assert "omite" in lowered
+
+
+def test_map_system_allows_up_to_five_quotes():
+    lowered = MAP_SYSTEM.lower()
+
+    assert "hasta 5" in lowered
+    assert "máximo 2" not in lowered
+
+
+def test_map_system_forbids_filler_and_ai_voice():
+    lowered = MAP_SYSTEM.lower()
+
+    assert "relleno" in lowered
+    for phrase in FILLER_PHRASES:
+        assert phrase in lowered, f"debe prohibir por su nombre {phrase!r}"
 
 
 def test_map_system_anchors_the_output_to_the_block_timespan():
@@ -84,29 +115,49 @@ def test_map_system_anchors_the_output_to_the_block_timespan():
 # --------------------------------------------------------------------------------------
 
 
-def test_reduce_system_lists_every_report_heading():
+def test_reduce_system_lists_every_overview_heading():
     for heading in REDUCE_HEADINGS:
         assert heading in REDUCE_SYSTEM, f"falta el encabezado {heading!r}"
 
 
-def test_reduce_system_headings_appear_in_the_report_order():
+def test_reduce_system_headings_appear_in_order():
     positions = [REDUCE_SYSTEM.index(heading) for heading in REDUCE_HEADINGS]
 
     assert positions == sorted(positions)
 
 
-def test_reduce_system_groups_by_topic_not_by_block():
+def test_reduce_system_dropped_the_old_thematic_report_structure():
+    for heading in OLD_REDUCE_HEADINGS:
+        assert heading not in REDUCE_SYSTEM, f"el encabezado viejo {heading!r} ha vuelto"
+
+
+def test_reduce_system_orients_instead_of_rewriting_the_content():
     lowered = REDUCE_SYSTEM.lower()
 
-    assert "agrupa por tema" in lowered
+    assert "visión general" in lowered
+    assert "sin desarrollar" in lowered
+
+
+def test_reduce_system_forbids_inventing_and_interpreting_beyond_what_was_said():
+    lowered = REDUCE_SYSTEM.lower()
+
     assert "no inventes" in lowered
+    assert "no interpretes" in lowered
+
+
+def test_reduce_system_forbids_filler_and_ai_voice():
+    lowered = REDUCE_SYSTEM.lower()
+
+    assert "relleno" in lowered
+    for phrase in FILLER_PHRASES:
+        assert phrase in lowered, f"debe prohibir por su nombre {phrase!r}"
 
 
 def test_reduce_system_writes_the_report_in_spanish():
     assert "español" in REDUCE_SYSTEM.lower()
 
 
-def test_reduce_system_describes_the_per_block_walkthrough_format():
+def test_reduce_system_describes_the_block_index_line_format():
     assert "[mm:ss]" in REDUCE_SYSTEM.lower()
 
 
