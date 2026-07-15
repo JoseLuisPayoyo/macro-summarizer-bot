@@ -12,34 +12,34 @@ Detalles de la capa de Telegram que resuelve este módulo:
 - El pipeline tarda minutos: se responde con UN mensaje de estado que se va EDITANDO con
   los hitos del `progress` del pipeline. Una edición que falle (rate limit de Telegram,
   texto idéntico...) se ignora: el progreso es cosmético y no debe tumbar el resumen.
-- La entrega es POR BLOQUES: primero la visión general del reduce (resumen ejecutivo +
-  índice) y después un mensaje por bloque en vista compacta (tema, tesis, datos y
-  predicciones) con un botón inline que expande/contrae el detalle completo. Las vistas
-  salen de parsear la extracción del map por sus apartados `###` (sin volver a llamar al
-  LLM); un apartado que falte se trata como ausente, nunca como error.
-- El toggle necesita las dos vistas de cada bloque a mano cuando llega el callback: se
-  guardan en `bot_data` por request_id, con una cola FIFO acotada para que un proceso de
-  semanas no acumule memoria sin límite (un toggle de un informe ya desalojado responde
-  con un aviso, no con un fallo).
-- El informe de una charla larga supera el límite de 4096 caracteres por mensaje:
-  `split_message` lo trocea cortando por párrafos/líneas/espacios, nunca a media palabra
-  y evitando (mientras se pueda) partir un bloque de código por la mitad. Lo que se
-  muestra EDITANDO un mensaje (la vista expandida) no puede trocearse: `clip_message` lo
-  recorta declarándolo.
-- Los errores del contrato del pipeline se traducen a mensajes de usuario en español
-  (`error_message`); el detalle técnico va al log, nunca al chat.
+- La ENTREGA parsea la salida del reduce por su contrato de encabezados (`parse_report`)
+  y la envía en `parse_mode=HTML`: un mensaje con el Panorama, uno por bloque —encabezado
+  en negrita y contenido en `<blockquote expandable>`, que Telegram colapsa solo, sin
+  botones ni callbacks— y el cierre de tesis y conclusiones con el pie. Si el reduce se
+  desvía del contrato, se degrada al summary escapado y troceado: nunca se falla por
+  formato.
+- SEGURIDAD DEL HTML (lo que antes nos hacía evitar `parse_mode`): TODO texto que venga
+  del LLM pasa por `html.escape`; las únicas etiquetas vivas son las que pone el bot
+  (`<b>`, `<blockquote expandable>`). Y al trocear un mensaje largo se corta el texto
+  CRUDO primero y se escapa DESPUÉS — al revés se partiría una entidad (`&amp;`) por la
+  mitad.
+- Los mensajes de estado y de error siguen en texto plano, sin `parse_mode`.
+- `split_message` (el troceo del texto crudo) corta por párrafos/líneas/espacios, nunca
+  a media palabra, y la concatenación de los trozos reconstruye el original.
 
 Todos los textos de cara al usuario van en español.
 """
 
+import html
 import logging
-from uuid import uuid4
+from collections.abc import Callable
+from dataclasses import dataclass
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Update
+from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -48,8 +48,7 @@ from telegram.ext import (
 
 from macrobot.config import Settings, get_settings
 from macrobot.llm import LLMError, OpenRouterClient
-from macrobot.pipeline import BlockSummary, SummaryResult, summarize
-from macrobot.prompts import MAP_SECTION_TITLES
+from macrobot.pipeline import SummaryResult, summarize
 from macrobot.transcript import NoSubtitlesError, TranscriptError, find_youtube_url
 
 logger = logging.getLogger(__name__)
@@ -94,26 +93,12 @@ UNEXPECTED_ERROR_MESSAGE = (
     "a quien administre el bot."
 )
 
-EXPAND_BUTTON_LABEL = "🔽 Ver detalle completo"
-COLLAPSE_BUTTON_LABEL = "🔼 Ver menos"
-EXPIRED_BLOCKS_ANSWER = "Ya no guardo el detalle de este informe. Pídeme el resumen otra vez."
+# Encabezados fijos del contrato de REDUCE_SYSTEM (los demás `## ` son bloques).
+PANORAMA_HEADING = "Panorama"
+CONCLUSIONS_HEADING = "Tesis y conclusiones"
 
-# El "Tema del bloque" no es una sección de las vistas: va en el encabezado del mensaje.
-_TOPIC_SECTION = MAP_SECTION_TITLES[0]
-
-# Vista compacta (la que se manda por defecto): lo esencial de cada bloque.
-COMPACT_BLOCK_SECTIONS = (
-    "Tesis / ideas centrales",
-    "Datos y cifras citados",
-    "Predicciones / escenarios",
-)
-
-# Vista completa (al pulsar el botón): todos los apartados del esquema del map.
-FULL_BLOCK_SECTIONS = tuple(title for title in MAP_SECTION_TITLES if title != _TOPIC_SECTION)
-
-_CALLBACK_PREFIX = "blk"  # callback_data: "blk:<request_id>:<índice>:<full|compact>"
-_BLOCK_VIEWS_KEY = "block_views"  # clave en bot_data del almacén de vistas por request
-_MAX_STORED_REQUESTS = 20  # informes cuyos toggles siguen vivos; más allá, FIFO
+_QUOTE_OPEN = "<blockquote expandable>"
+_QUOTE_CLOSE = "</blockquote>"
 
 
 # --------------------------------------------------------------------------------------
@@ -143,8 +128,8 @@ def _cut_point(text: str, limit: int) -> int:
 def split_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
     """Trocea un texto largo en mensajes que quepan en el límite de Telegram.
 
-    La concatenación de los trozos reconstruye el texto original exactamente: los
-    separadores por los que se corta se quedan al final del trozo anterior.
+    Opera sobre texto CRUDO (sin escapar). La concatenación de los trozos reconstruye el
+    texto original exactamente: los separadores se quedan al final del trozo anterior.
     """
     parts: list[str] = []
     remaining = text
@@ -202,101 +187,153 @@ def build_footer(result: SummaryResult, settings: Settings) -> str:
     return "\n\n📊 " + " · ".join(pieces)
 
 
-def parse_extraction(extraction: str) -> dict[str, str]:
-    """Trocea una extracción del map en sus apartados: título `###` -> contenido.
+@dataclass(frozen=True, slots=True)
+class ReduceReport:
+    """La salida del reduce partida por su contrato de encabezados."""
 
-    El LLM no es 100% determinista: un apartado que falte, que llegue vacío o con otro
-    título simplemente no aparece en el resultado. Lo anterior al primer `###` (la línea
-    del rango temporal) se descarta: el rango ya viaja en `BlockSummary.timespan`.
+    panorama: str
+    blocks: list[tuple[str, str]]  # (encabezado "[mm:ss] tema", contenido)
+    conclusions: str
+
+
+def parse_report(summary: str) -> ReduceReport:
+    """Parte la salida del reduce por los encabezados `## ` del contrato de REDUCE_SYSTEM.
+
+    Tolerante con un LLM que se desvíe: un encabezado ausente deja su sección vacía, el
+    texto antes del primer `## ` cuenta como panorama y cualquier `## ` que no sea el
+    Panorama ni el cierre se trata como un bloque. Nunca lanza por formato.
     """
-    sections: dict[str, str] = {}
-    current: str | None = None
-    buffer: list[str] = []
-
-    def flush() -> None:
-        if current is not None and (content := "\n".join(buffer).strip()):
-            sections[current] = content
-
-    for line in extraction.splitlines():
-        if line.startswith("### "):
-            flush()
-            current = line.removeprefix("### ").strip()
-            buffer = []
+    panorama: list[str] = []
+    conclusions: list[str] = []
+    blocks: list[tuple[str, list[str]]] = []
+    current = panorama  # el preámbulo sin encabezado cuenta como panorama
+    for line in summary.splitlines():
+        if line.startswith("## "):
+            title = line.removeprefix("## ").strip()
+            if title == PANORAMA_HEADING:
+                current = panorama
+            elif title == CONCLUSIONS_HEADING:
+                current = conclusions
+            else:
+                blocks.append((title, []))
+                current = blocks[-1][1]
         else:
-            buffer.append(line)
-    flush()
-    return sections
+            current.append(line)
+    return ReduceReport(
+        panorama="\n".join(panorama).strip(),
+        blocks=[(title, "\n".join(lines).strip()) for title, lines in blocks],
+        conclusions="\n".join(conclusions).strip(),
+    )
 
 
-def _render_block(block: BlockSummary, titles: tuple[str, ...]) -> str:
-    """Encabezado (número, rango y tema) más los apartados pedidos que existan."""
-    sections = parse_extraction(block.extraction)
-    header = f"🧩 Bloque {block.index + 1} · [{block.timespan}]"
-    if topic := sections.get(_TOPIC_SECTION):
-        header += f"\n{topic}"
-    pieces = [header]
-    pieces += [f"▫️ {title}\n{content}" for title in titles if (content := sections.get(title))]
-    return "\n\n".join(pieces)
+def _escape(text: str) -> str:
+    """Escapa `<`, `>` y `&` para `parse_mode=HTML` (el texto nunca va en atributos)."""
+    return html.escape(text, quote=False)
 
 
-def compact_block_view(block: BlockSummary) -> str:
-    """La vista por defecto de un bloque: tema, tesis, datos y predicciones."""
-    return _render_block(block, COMPACT_BLOCK_SECTIONS)
+def _render_closing(raw: str) -> str:
+    """Escapa el cierre del informe convirtiendo sus líneas `### X` en negrita."""
+    rendered = []
+    for line in raw.splitlines():
+        if line.startswith("### "):
+            rendered.append(f"<b>{_escape(line.removeprefix('### '))}</b>")
+        else:
+            rendered.append(_escape(line))
+    return "\n".join(rendered)
 
 
-def full_block_view(block: BlockSummary) -> str:
-    """La vista expandida: todos los apartados del esquema presentes en la extracción."""
-    return _render_block(block, FULL_BLOCK_SECTIONS)
+def _split_raw(text: str, budget: int, render: Callable[[str], str]) -> list[str]:
+    """Trocea texto CRUDO en trozos cuya versión renderizada (escapada) quepa en `budget`.
 
-
-def clip_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> str:
-    """Recorta un texto a UN mensaje de Telegram, con corte limpio y aviso del recorte.
-
-    Para texto que se muestra editando un mensaje ya enviado (la vista expandida), donde
-    trocear en varios mensajes no es una opción.
+    Se trocea SIEMPRE antes de escapar —al revés se partiría una entidad `&amp;` por la
+    mitad— y se comprueba después: si el escape infló un trozo por encima del hueco, se
+    recorta y el resto vuelve a la cola. La concatenación reconstruye el original.
     """
-    if len(text) <= limit:
-        return text
-    notice = "\n\n… (recortado: el detalle completo no cabe en un mensaje de Telegram)"
-    cut = _cut_point(text, limit - len(notice))
-    return text[:cut].rstrip() + notice
+    parts: list[str] = []
+    pending = split_message(text, budget)
+    while pending:
+        piece = pending.pop(0)
+        excess = len(render(piece)) - budget
+        if excess <= 0:
+            parts.append(piece)
+            continue
+        cut = _cut_point(piece, max(1, len(piece) - excess))
+        pending.insert(0, piece[cut:])
+        pending.insert(0, piece[:cut])
+    return parts
 
 
-def block_keyboard(request_id: str, index: int, *, expanded: bool) -> InlineKeyboardMarkup:
-    """El botón inline de un bloque: siempre ofrece la vista contraria a la mostrada."""
-    if expanded:
-        label, target = COLLAPSE_BUTTON_LABEL, "compact"
+def _section_messages(
+    title: str | None,
+    body: str,
+    *,
+    quoted: bool,
+    limit: int,
+    render: Callable[[str], str],
+) -> list[str]:
+    """Los mensajes HTML de una sección: título en negrita y cuerpo (en cita si `quoted`)."""
+    header = f"<b>{_escape(title)}</b>" if title else ""
+    if not body:
+        return [header] if header else []
+    prefix = f"{header}\n" if header else ""
+    overhead = len(prefix) + (len(_QUOTE_OPEN) + len(_QUOTE_CLOSE) if quoted else 0)
+    messages: list[str] = []
+    for position, piece in enumerate(_split_raw(body, limit - overhead, render)):
+        rendered = render(piece)
+        if quoted:
+            rendered = f"{_QUOTE_OPEN}{rendered}{_QUOTE_CLOSE}"
+        messages.append((prefix if position == 0 else "") + rendered)
+    return messages
+
+
+def build_block_message(heading: str, body: str, limit: int = TELEGRAM_MAX_CHARS) -> list[str]:
+    """El/los mensajes HTML de un bloque: encabezado en negrita + cita expandible.
+
+    Telegram colapsa solo el `<blockquote expandable>` largo, así que el detalle se
+    expande con el gesto nativo del cliente, sin botones ni callbacks. Si el contenido
+    no cabe en un mensaje, cada trozo va en su propia cita; el encabezado, en el primero.
+    """
+    return _section_messages(heading, body, quoted=True, limit=limit, render=_escape)
+
+
+def build_report_messages(
+    result: SummaryResult, settings: Settings, limit: int = TELEGRAM_MAX_CHARS
+) -> list[str]:
+    """Todos los mensajes HTML del informe, en su orden de envío.
+
+    Panorama, un mensaje por bloque y el cierre de tesis y conclusiones (el pie de
+    bloques/tokens/coste va en el último mensaje). Si el reduce no siguió el contrato de
+    encabezados (ni bloques ni cierre), se degrada al summary completo escapado y
+    troceado: nunca se falla por formato.
+    """
+    report = parse_report(result.summary)
+    footer = build_footer(result, settings)
+
+    if not report.blocks and not report.conclusions:
+        body = result.summary.strip() + footer
+        return _section_messages(None, body, quoted=False, limit=limit, render=_escape)
+
+    messages: list[str] = []
+    if report.panorama:
+        messages += _section_messages(
+            f"🧭 {PANORAMA_HEADING}", report.panorama, quoted=False, limit=limit, render=_escape
+        )
+    for heading, body in report.blocks:
+        messages += build_block_message(heading, body, limit)
+    if report.conclusions:
+        messages += _section_messages(
+            f"📌 {CONCLUSIONS_HEADING}",
+            report.conclusions + footer,
+            quoted=False,
+            limit=limit,
+            render=_render_closing,
+        )
     else:
-        label, target = EXPAND_BUTTON_LABEL, "full"
-    callback_data = f"{_CALLBACK_PREFIX}:{request_id}:{index}:{target}"
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=callback_data)]])
-
-
-def parse_block_callback(data: str) -> tuple[str, int, bool]:
-    """Descompone el callback_data de un botón de bloque: (request_id, índice, ¿a completa?).
-
-    Lanza `ValueError` si el dato no es un toggle de bloque bien formado.
-    """
-    prefix, request_id, index, target = data.split(":")  # ValueError si no son 4 partes
-    if prefix != _CALLBACK_PREFIX or target not in ("full", "compact"):
-        raise ValueError(f"callback_data desconocido: {data!r}")
-    return request_id, int(index), target == "full"
-
-
-def store_block_views(
-    store: dict[str, list[tuple[str, str]]],
-    request_id: str,
-    views: list[tuple[str, str]],
-    max_requests: int = _MAX_STORED_REQUESTS,
-) -> None:
-    """Guarda las vistas (compacta, completa) de un informe y desaloja las más antiguas.
-
-    El almacén es un dict ordenado por inserción: pasado `max_requests`, cae el informe
-    más antiguo y sus botones responden con `EXPIRED_BLOCKS_ANSWER` en vez de romperse.
-    """
-    store[request_id] = views
-    while len(store) > max_requests:
-        store.pop(next(iter(store)))
+        # Sin cierre no hay dónde colgar el pie: va en su propio mensaje, nunca se pierde.
+        messages += _section_messages(
+            None, footer.strip(), quoted=False, limit=limit, render=_escape
+        )
+    return messages
 
 
 # --------------------------------------------------------------------------------------
@@ -353,64 +390,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         result.total_usage.total_tokens,
     )
     await progress(DONE_MESSAGE)
-
-    # 1) La visión general del reduce (resumen ejecutivo + índice), con el pie.
-    overview = result.summary + build_footer(result, settings)
-    for part in split_message(overview):
-        if part.strip():
-            await message.reply_text(part)
-
-    # 2) Un mensaje por bloque, en vista compacta y con el botón de expandir. El toggle
-    # edita el ÚLTIMO mensaje del bloque, así que es esa parte la que se guarda como
-    # vista compacta; la expandida se recorta a un único mensaje editable.
-    request_id = uuid4().hex[:8]
-    views: list[tuple[str, str]] = []
-    for block in result.blocks:
-        parts = split_message(compact_block_view(block))
-        for part in parts[:-1]:
-            await message.reply_text(part)
-        compact = parts[-1]
-        await message.reply_text(
-            compact, reply_markup=block_keyboard(request_id, block.index, expanded=False)
-        )
-        views.append((compact, clip_message(full_block_view(block))))
-    store_block_views(context.bot_data.setdefault(_BLOCK_VIEWS_KEY, {}), request_id, views)
-
-
-async def handle_block_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler del botón de un bloque: alterna entre la vista compacta y la completa.
-
-    Siempre responde al callback (aunque sea en vacío) para que Telegram no deje el
-    reloj de carga colgado en el cliente.
-    """
-    query = update.callback_query
-    if query is None or query.data is None:
-        return
-
-    try:
-        request_id, index, wants_full = parse_block_callback(query.data)
-    except ValueError:
-        logger.debug("callback_data inesperado: %r", query.data)
-        await query.answer()
-        return
-
-    store: dict[str, list[tuple[str, str]]] = context.bot_data.get(_BLOCK_VIEWS_KEY, {})
-    views = store.get(request_id)
-    if views is None or not 0 <= index < len(views):
-        # El informe ya cayó de la cola FIFO (o el proceso se reinició): se avisa, no se rompe.
-        await query.answer(EXPIRED_BLOCKS_ANSWER, show_alert=True)
-        return
-
-    compact, full = views[index]
-    try:
-        await query.edit_message_text(
-            full if wants_full else compact,
-            reply_markup=block_keyboard(request_id, index, expanded=wants_full),
-        )
-    except TelegramError:
-        # Doble pulsación o rate limit: el botón es cosmético, el informe ya está entregado.
-        logger.debug("No se pudo editar el mensaje del bloque", exc_info=True)
-    await query.answer()
+    for text in build_report_messages(result, settings):
+        await message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 # --------------------------------------------------------------------------------------
@@ -431,9 +412,6 @@ def build_application(settings: Settings, client: OpenRouterClient) -> Applicati
     application.bot_data["client"] = client
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(
-        CallbackQueryHandler(handle_block_toggle, pattern=rf"^{_CALLBACK_PREFIX}:")
-    )
     return application
 
 

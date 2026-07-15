@@ -1,10 +1,11 @@
 """Tests de `macrobot.prompts`.
 
 Los prompts son texto de cara al usuario (el informe sale de ellos), así que estos tests
-fijan su contrato: que los apartados del esquema de extracción estén todos, que el reduce
-sea solo una visión general breve (resumen ejecutivo + índice, sin reescribir el
-contenido), que ambos prohíban el lenguaje de relleno, y que los helpers de formato
-—funciones puras— monten el mensaje de usuario sin perder nada.
+fijan su contrato: que los apartados del esquema de extracción estén todos (el map es
+material intermedio para el reduce), que el reduce produzca el informe completo con los
+encabezados exactos que `bot.py` parsea (Panorama, un `## [mm:ss]` por bloque y el cierre
+de tesis y conclusiones) sin repetir temas ya tratados, que ambos prohíban el lenguaje de
+relleno, y que los helpers de formato —funciones puras— monten el mensaje sin perder nada.
 """
 
 from macrobot.prompts import (
@@ -23,18 +24,28 @@ MAP_SECTIONS = [
     "### Predicciones / escenarios",
     "### Activos / mercados / tickers",
     "### Política monetaria / bancos centrales",
+]
+
+# Apartados retirados del esquema map (citas y glosario ya no aportan al reduce).
+OLD_MAP_SECTIONS = [
     "### Citas textuales destacadas",
     "### Términos y conceptos clave",
 ]
 
+# El contrato del informe del reduce, tal como lo parsea bot.py.
 REDUCE_HEADINGS = [
-    "## Resumen ejecutivo",
-    "## Índice de bloques",
+    "## Panorama",
+    "## Tesis y conclusiones",
+    "### Tesis principales",
+    "### Conclusiones",
+    "### Tesis de inversión",
 ]
 
-# La estructura vieja del reduce (el informe temático) no debe volver: el cuerpo del
-# informe son ahora las extracciones de los bloques, y el reduce solo orienta.
+# Estructuras viejas del reduce que no deben volver (se comprueban línea a línea:
+# "## Tesis principales" es substring de "### Tesis principales", que sí existe).
 OLD_REDUCE_HEADINGS = [
+    "## Resumen ejecutivo",
+    "## Índice de bloques",
     "## Tesis principales",
     "## Datos y cifras clave",
     "## Predicciones y escenarios",
@@ -90,19 +101,26 @@ def test_map_system_warns_that_the_transcript_may_come_raw():
     assert "contexto" in lowered
 
 
-def test_map_system_demands_exhaustive_output_and_omitting_empty_sections():
+def test_map_system_demands_exhaustive_ideas_and_omitting_empty_sections():
     lowered = MAP_SYSTEM.lower()
 
     assert "exhaustivo" in lowered
-    assert "compacta" not in lowered  # la instrucción vieja de comprimir ya no existe
+    # La regla vieja de preferir extracciones largas no debe volver.
+    assert "extracción larga" not in lowered
     assert "omite" in lowered
 
 
-def test_map_system_allows_up_to_five_quotes():
+def test_map_system_is_ruthless_with_residual_content():
     lowered = MAP_SYSTEM.lower()
 
-    assert "hasta 5" in lowered
-    assert "máximo 2" not in lowered
+    assert "anécdotas" in lowered
+    assert "digresiones" in lowered
+    assert "conceptos básicos" in lowered  # el lector sabe de macro: no se le explica nada
+
+
+def test_map_system_dropped_the_quotes_and_glossary_sections():
+    for section in OLD_MAP_SECTIONS:
+        assert section not in MAP_SYSTEM, f"el apartado retirado {section!r} ha vuelto"
 
 
 def test_map_system_forbids_filler_and_ai_voice():
@@ -122,7 +140,7 @@ def test_map_system_anchors_the_output_to_the_block_timespan():
 # --------------------------------------------------------------------------------------
 
 
-def test_reduce_system_lists_every_overview_heading():
+def test_reduce_system_lists_every_report_heading():
     for heading in REDUCE_HEADINGS:
         assert heading in REDUCE_SYSTEM, f"falta el encabezado {heading!r}"
 
@@ -133,16 +151,29 @@ def test_reduce_system_headings_appear_in_order():
     assert positions == sorted(positions)
 
 
-def test_reduce_system_dropped_the_old_thematic_report_structure():
+def test_reduce_system_describes_the_per_block_heading_format():
+    assert "## [mm:ss]" in REDUCE_SYSTEM
+
+
+def test_reduce_system_dropped_the_old_structures():
+    lines = REDUCE_SYSTEM.splitlines()
     for heading in OLD_REDUCE_HEADINGS:
-        assert heading not in REDUCE_SYSTEM, f"el encabezado viejo {heading!r} ha vuelto"
+        assert heading not in lines, f"el encabezado viejo {heading!r} ha vuelto"
 
 
-def test_reduce_system_orients_instead_of_rewriting_the_content():
+def test_reduce_system_forbids_repeating_what_earlier_blocks_already_covered():
     lowered = REDUCE_SYSTEM.lower()
 
-    assert "visión general" in lowered
-    assert "sin desarrollar" in lowered
+    assert "no lo repitas" in lowered
+    assert "ya tratado en [mm:ss]" in lowered  # la referencia que sustituye a la repetición
+
+
+def test_reduce_system_keeps_data_inside_ideas_not_in_lists():
+    assert "listas de cifras" in REDUCE_SYSTEM.lower()
+
+
+def test_reduce_system_gathers_theses_and_conclusions_only_in_the_final_section():
+    assert "solo en la sección final" in REDUCE_SYSTEM.lower()
 
 
 def test_reduce_system_forbids_inventing_and_interpreting_beyond_what_was_said():
@@ -162,10 +193,6 @@ def test_reduce_system_forbids_filler_and_ai_voice():
 
 def test_reduce_system_writes_the_report_in_spanish():
     assert "español" in REDUCE_SYSTEM.lower()
-
-
-def test_reduce_system_describes_the_block_index_line_format():
-    assert "[mm:ss]" in REDUCE_SYSTEM.lower()
 
 
 # --------------------------------------------------------------------------------------

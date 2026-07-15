@@ -32,19 +32,22 @@ URL de YouTube
    │
    ├─ 3. MAP  (pipeline.run_map + prompts.MAP_SYSTEM + llm.py)
    │     Una llamada por bloque al modelo BARATO (MAP_MODEL), en paralelo.
-   │     No resume en prosa: hace extracción estructurada según un esquema macro
-   │     (tesis, datos y cifras, previsiones, riesgos, citas), EXHAUSTIVA y sin voz
-   │     de IA: las extracciones son el cuerpo real del informe.
+   │     La capa de FIDELIDAD: es la única que ve la transcripción real. Extrae según
+   │     un esquema macro (tesis, argumentos, datos, previsiones, activos, política
+   │     monetaria), exhaustiva en ideas e implacable con la paja. Su salida es
+   │     MATERIAL INTERMEDIO para el reduce: el usuario no la lee.
    │
    ├─ 4. REDUCE  (pipeline.run_reduce + prompts.REDUCE_SYSTEM + llm.py)
    │     UNA sola llamada al modelo BUENO (REDUCE_MODEL) con todas las extracciones.
-   │     NO sintetiza el contenido: produce solo una visión general breve (resumen
-   │     ejecutivo + índice de bloques) que orienta antes de las extracciones.
+   │     Produce EL INFORME que lee el usuario: Panorama, un apartado `## [mm:ss]` por
+   │     bloque (deduplicando lo ya tratado: es el único punto que ve la charla entera)
+   │     y el cierre "Tesis y conclusiones". Sus encabezados son un CONTRATO que
+   │     bot.py parsea.
    │
    └─ 5. ENTREGA  (bot.py)
-         Primero la visión general del reduce; después un mensaje por bloque en vista
-         compacta con botón inline para expandir/contraer el detalle completo. Todo
-         troceado a 4096 caracteres (límite de Telegram).
+         En parse_mode=HTML: un mensaje con el Panorama, uno por bloque (encabezado en
+         negrita + <blockquote expandable>, que Telegram colapsa solo) y el cierre con
+         el pie. Todo troceado a 4096 caracteres (límite de Telegram).
 ```
 
 Todas las llamadas a LLM van por **OpenRouter** (`llm.py` es el único módulo que habla con
@@ -133,25 +136,30 @@ Implementados y cubiertos con tests:
 - `llm.py` — cliente asíncrono de OpenRouter: reintentos con backoff+jitter solo en
   fallos transitorios (429/5xx/transporte), respeta `Retry-After`, devuelve siempre
   `TokenUsage`, y un único cliente sirve a las llamadas en paralelo del map (fase 2).
-- `prompts.py` — `MAP_SYSTEM` (esquema de extracción macro, EXHAUSTIVO, hasta 5 citas,
-  con prohibición explícita de relleno y "voz de IA") y `REDUCE_SYSTEM` (SOLO visión
-  general: resumen ejecutivo + índice de bloques; ya no reescribe el contenido), con los
-  helpers puros `build_map_user_prompt` / `build_reduce_user_prompt` (fase 2, revisados
-  después de la fase 4). La tupla `MAP_SECTION_TITLES` expone los títulos `###` del
-  esquema: es el contrato con el que `bot` parsea cada extracción, y un test de prompts
-  vigila que no diverja del texto de `MAP_SYSTEM`.
+- `prompts.py` — `MAP_SYSTEM` (esquema de extracción macro: exhaustivo en IDEAS,
+  implacable con ejemplos/anécdotas/digresiones, sin explicar conceptos básicos — el
+  lector es experto — y con prohibición explícita de relleno y "voz de IA"; material
+  intermedio para el reduce, no se entrega) y `REDUCE_SYSTEM` (EL INFORME que lee el
+  usuario: `## Panorama`, un `## [mm:ss] tema` por bloque SIN repetir lo ya tratado —
+  puede referenciar "(ya tratado en [mm:ss])" —, datos solo dentro de las ideas que
+  sostienen, y el cierre `## Tesis y conclusiones` con `### Tesis principales` /
+  `### Conclusiones` / `### Tesis de inversión`, únicas secciones donde van las tesis),
+  con los helpers puros `build_map_user_prompt` / `build_reduce_user_prompt`. Los
+  encabezados del reduce son un CONTRATO: `bot.parse_report` los parsea, y los tests de
+  prompts los fijan. `MAP_SECTION_TITLES` expone los títulos `###` del esquema map con
+  su test guardián.
 - `pipeline.py` — `summarize(url, client, settings, progress=None)` orquesta
   transcripción -> troceo -> map en paralelo (semáforo de `max_concurrency`) -> reduce, y
   devuelve `SummaryResult` con el uso de tokens desglosado map/reduce/total (fase 3) y
   `blocks: list[BlockSummary]` (`index` cronológico desde 0, `timespan` del Chunk y
-  `extraction` tal cual salió del map): las extracciones por bloque que el bot entrega
-  como cuerpo del informe.
+  `extraction` tal cual salió del map): material intermedio que ya NO se entrega al
+  usuario, pero se conserva en el resultado.
 - `config.py` — completo, incluido `get_settings()` (única instancia, con `lru_cache`).
 - `bot.py` — la aplicación de python-telegram-bot en polling y el entry point
   `uv run macrobot` (fase 4). La lógica pura (troceo a 4096, traducción de errores,
-  coste estimado, pie del informe, parseo de extracciones, vistas de bloque y toggle)
-  está separada de los handlers y cubierta por tests; los handlers son capa fina sin
-  cobertura unitaria, a propósito.
+  coste estimado, pie del informe, `parse_report` y la construcción de los mensajes
+  HTML) está separada de los handlers y cubierta por tests; los handlers son capa fina
+  sin cobertura unitaria, a propósito.
 
 Sigue como stub (`raise NotImplementedError`): `whisper.py`.
 
@@ -165,24 +173,20 @@ Decisiones de la capa de Telegram (fase 4):
 - UN mensaje de estado por vídeo, que se EDITA con cada hito del `progress`; las
   ediciones fallidas (rate limit, texto idéntico) se ignoran con log en DEBUG — el
   progreso es cosmético y no debe tumbar un resumen de varios minutos.
-- El informe se envía como TEXTO PLANO (sin `parse_mode`): el Markdown que genera un LLM
-  rompe el parser de entidades de Telegram con facilidad, y un informe feo es mejor que
-  un informe que no llega.
-- ENTREGA POR BLOQUES: primero la visión general del reduce (resumen ejecutivo + índice,
-  con el pie), y después un mensaje por `BlockSummary` en vista COMPACTA (tema en el
-  encabezado + tesis, datos y predicciones) con un botón inline "🔽 Ver detalle completo".
-  El `CallbackQueryHandler` alterna a la vista completa (todos los apartados) y de vuelta
-  ("🔼 Ver menos"). Las vistas salen de parsear la extracción por los títulos de
-  `MAP_SECTION_TITLES` — sin volver a llamar al LLM — y un apartado ausente se omite,
-  nunca es error. El callback se responde SIEMPRE (`answer`), aunque sea en vacío.
-- Las dos vistas de cada bloque se guardan en `bot_data["block_views"]` por request_id
-  (uuid corto), en una cola FIFO de máx. 20 informes; un toggle de un informe desalojado
-  (o de antes de un reinicio) responde con un aviso. La vista expandida se muestra
-  EDITANDO el mensaje, así que no puede trocearse: `clip_message` la recorta a 4096
-  declarando el recorte.
-- `split_message` corta por párrafo > línea > espacio, nunca a media palabra, y evita
-  partir bloques de código (paridad de vallas ```) mientras sea posible; la concatenación
-  de los trozos reconstruye el original byte a byte.
+- El informe se envía en `parse_mode=HTML` con CITAS EXPANDIBLES nativas: un mensaje con
+  el Panorama, uno por bloque (`<b>[mm:ss] Tema</b>` + `<blockquote expandable>` con el
+  contenido, que Telegram colapsa solo — sin botones ni callbacks) y el cierre "Tesis y
+  conclusiones" con el pie. `bot.parse_report` parte `result.summary` por el contrato de
+  encabezados del reduce; si el LLM se desvía (ni bloques ni cierre), se degrada al
+  summary escapado y troceado: nunca se falla por formato.
+- SEGURIDAD DEL HTML (lo que antes nos hacía enviar texto plano): TODO texto que venga
+  del LLM pasa por `html.escape`; las únicas etiquetas vivas son las que pone el bot
+  (`<b>`, `<blockquote expandable>`). Al trocear, el corte va sobre el texto CRUDO y el
+  escape DESPUÉS — al revés partiría una entidad (`&amp;`) por la mitad. Cada trozo va
+  en su propia cita expandible. Los mensajes de estado y de error siguen en texto plano.
+- `split_message` (troceo del texto crudo) corta por párrafo > línea > espacio, nunca a
+  media palabra, y evita partir bloques de código (paridad de vallas ```) mientras sea
+  posible; la concatenación de los trozos reconstruye el original byte a byte.
 - El coste del pie sale de los precios `*_USD_PER_MTOK` de `Settings` (por pata:
   entrada/salida de map y de reduce). Sin precios configurados, el pie omite el coste:
   nunca se inventa.
@@ -190,7 +194,7 @@ Decisiones de la capa de Telegram (fase 4):
   `Application`; el detalle técnico de los errores va al log (`logging`), nunca al chat.
 - La salida de cada map empieza con el rango temporal del bloque (lo exige `MAP_SYSTEM` y
   lo inyecta `build_map_user_prompt`): así el reduce recibe las marcas de tiempo sin
-  cableado extra, y de ahí sale el "Índice de bloques" de la visión general.
+  cableado extra, y de ahí salen los encabezados `## [mm:ss] tema` del informe.
 
 ## Cómo se prueba
 

@@ -1,41 +1,35 @@
 """Tests de la lógica pura de `macrobot.bot`.
 
-Todo lo que aquí se prueba son funciones sin SDK real de Telegram, sin red y sin mocks:
-el troceo del informe al límite de 4096, la traducción de excepciones a mensajes de
-usuario, el pie con el coste estimado, el parseo de una extracción del map en sus
-apartados `###`, las vistas compacta/completa de cada bloque y el toggle del botón
-inline (que solo construye objetos de datos del SDK, sin red). La integración con
-python-telegram-bot (handlers, polling) es una capa fina que no se cubre con unitarios.
+Todo lo que aquí se prueba son funciones sin SDK de Telegram, sin red y sin mocks: el
+troceo al límite de 4096, la traducción de excepciones a mensajes de usuario, el pie con
+el coste estimado, el parseo de la salida del reduce por su contrato de encabezados y la
+construcción de los mensajes HTML (con TODO el texto del LLM escapado: las únicas
+etiquetas vivas son las que pone el bot). La integración con python-telegram-bot
+(handlers, polling) es una capa fina que no se cubre con unitarios.
 """
+
+import html
+import re
 
 import pytest
 
 from macrobot.bot import (
-    COLLAPSE_BUTTON_LABEL,
-    COMPACT_BLOCK_SECTIONS,
-    EXPAND_BUTTON_LABEL,
-    FULL_BLOCK_SECTIONS,
     LLM_ERROR_MESSAGE,
     NO_SUBTITLES_MESSAGE,
     TELEGRAM_MAX_CHARS,
     UNEXPECTED_ERROR_MESSAGE,
     VIDEO_ERROR_MESSAGE,
-    block_keyboard,
+    build_block_message,
     build_footer,
-    clip_message,
-    compact_block_view,
+    build_report_messages,
     error_message,
     estimate_cost,
-    full_block_view,
-    parse_block_callback,
-    parse_extraction,
+    parse_report,
     split_message,
-    store_block_views,
 )
 from macrobot.config import Settings
 from macrobot.llm import LLMError, LLMRateLimitError, TokenUsage
-from macrobot.pipeline import BlockSummary, SummaryResult
-from macrobot.prompts import MAP_SECTION_TITLES
+from macrobot.pipeline import SummaryResult
 from macrobot.transcript import NoSubtitlesError, TranscriptError, find_youtube_url
 
 
@@ -60,45 +54,27 @@ def make_result(**overrides) -> SummaryResult:
     return SummaryResult(**values)
 
 
-# Una extracción de ejemplo con TODOS los apartados del esquema de MAP_SYSTEM.
-FULL_EXTRACTION = """\
-[00:10:00 - 00:20:00]
+# Una salida del reduce que sigue el contrato de encabezados de REDUCE_SYSTEM.
+SAMPLE_REPORT = """\
+## Panorama
+La charla arranca en la inflación y desemboca en una tesis de duración.
 
-### Tema del bloque
-La inflación subyacente en 2026.
+## [00:00] Contexto de inflación
+- El IPC subyacente sigue en 3,1 % y los alquileres entran con retraso.
 
-### Tesis / ideas centrales
-- La Fed va tarde, según el ponente.
+## [10:00] La Fed
+- Va tarde con los recortes (ya tratado en [00:00]).
 
-### Argumentos y razonamiento
-- Los alquileres entran con retraso de un año en el IPC.
+## Tesis y conclusiones
+### Tesis principales
+- La Fed recortará en septiembre si el IPC baja de 3 %.
 
-### Datos y cifras citados
-- IPC subyacente 3,1 % interanual (mayo 2026).
+### Conclusiones
+- El riesgo de la cartera está en la duración.
 
-### Predicciones / escenarios
-- Si el IPC baja de 3 %, recorte en septiembre.
-
-### Activos / mercados / tickers
-- Bonos del Tesoro a 10 años: alcista.
-
-### Política monetaria / bancos centrales
-- La Fed mantiene tipos en 4,25-4,50 %.
-
-### Citas textuales destacadas
-- "El último kilómetro es el más caro."
-
-### Términos y conceptos clave
-- Efecto base: distorsión interanual por el año anterior.
+### Tesis de inversión
+- Bonos largos: alcista, condicionado al IPC.
 """
-
-
-def make_block(
-    index: int = 0,
-    timespan: str = "00:10:00 - 00:20:00",
-    extraction: str = FULL_EXTRACTION,
-) -> BlockSummary:
-    return BlockSummary(index=index, timespan=timespan, extraction=extraction)
 
 
 # --------------------------------------------------------------------------------------
@@ -117,7 +93,7 @@ def test_a_message_without_a_url_yields_none():
 
 
 # --------------------------------------------------------------------------------------
-# Troceo del informe al límite de Telegram
+# Troceo al límite de Telegram (texto crudo; los mensajes HTML lo usan por debajo)
 # --------------------------------------------------------------------------------------
 
 
@@ -187,148 +163,152 @@ def test_split_message_does_not_cut_inside_a_code_block():
 
 
 # --------------------------------------------------------------------------------------
-# Parseo de una extracción del map en sus apartados ###
+# Parseo de la salida del reduce por su contrato de encabezados
 # --------------------------------------------------------------------------------------
 
 
-def test_parse_extraction_finds_every_section_of_a_complete_extraction():
-    sections = parse_extraction(FULL_EXTRACTION)
+def test_parse_report_splits_panorama_blocks_and_conclusions():
+    report = parse_report(SAMPLE_REPORT)
 
-    assert set(sections) == set(MAP_SECTION_TITLES)
-    assert sections["Tema del bloque"] == "La inflación subyacente en 2026."
-    assert "IPC subyacente 3,1 % interanual" in sections["Datos y cifras citados"]
-
-
-def test_parse_extraction_ignores_the_leading_timespan_line():
-    sections = parse_extraction(FULL_EXTRACTION)
-
-    assert all("[00:10:00 - 00:20:00]" not in content for content in sections.values())
-
-
-def test_parse_extraction_treats_missing_sections_as_absent_without_failing():
-    partial = "### Tema del bloque\nEl petróleo.\n\n### Datos y cifras citados\n- Brent a 92 $.\n"
-
-    sections = parse_extraction(partial)
-
-    assert sections == {
-        "Tema del bloque": "El petróleo.",
-        "Datos y cifras citados": "- Brent a 92 $.",
-    }
+    assert report.panorama == (
+        "La charla arranca en la inflación y desemboca en una tesis de duración."
+    )
+    assert [heading for heading, _ in report.blocks] == [
+        "[00:00] Contexto de inflación",
+        "[10:00] La Fed",
+    ]
+    assert report.blocks[0][1] == (
+        "- El IPC subyacente sigue en 3,1 % y los alquileres entran con retraso."
+    )
+    assert "### Tesis de inversión" in report.conclusions
+    assert "- Bonos largos: alcista, condicionado al IPC." in report.conclusions
 
 
-def test_parse_extraction_drops_sections_the_model_left_empty():
-    text = '### Tema del bloque\n\n### Citas textuales destacadas\n- "una cita"\n'
+def test_parse_report_treats_missing_headings_as_empty_sections():
+    report = parse_report("## [00:00] Único bloque\n- Una idea.\n")
 
-    sections = parse_extraction(text)
+    assert report.panorama == ""
+    assert report.blocks == [("[00:00] Único bloque", "- Una idea.")]
+    assert report.conclusions == ""
 
-    assert "Tema del bloque" not in sections
-    assert sections["Citas textuales destacadas"] == '- "una cita"'
+
+def test_parse_report_counts_a_preamble_without_heading_as_panorama():
+    report = parse_report("El modelo se saltó el encabezado.\n\n## Tesis y conclusiones\n- C.")
+
+    assert report.panorama == "El modelo se saltó el encabezado."
+    assert report.conclusions == "- C."
 
 
-def test_parse_extraction_of_prose_without_headings_yields_no_sections():
-    assert parse_extraction("el modelo se saltó el esquema y respondió en prosa") == {}
+def test_parse_report_of_prose_without_headings_yields_only_panorama():
+    report = parse_report("prosa sin estructura ninguna")
+
+    assert report.panorama == "prosa sin estructura ninguna"
+    assert report.blocks == []
+    assert report.conclusions == ""
 
 
 # --------------------------------------------------------------------------------------
-# Vistas compacta y completa de un bloque
+# Mensajes HTML: escape total del texto del LLM y citas expandibles
 # --------------------------------------------------------------------------------------
 
-
-def test_the_compact_view_shows_header_topic_and_the_compact_sections():
-    view = compact_block_view(make_block(index=2))
-
-    assert "Bloque 3" in view  # índice 0-based, numeración 1-based de cara al usuario
-    assert "00:10:00 - 00:20:00" in view
-    assert "La inflación subyacente en 2026." in view
-    for title in COMPACT_BLOCK_SECTIONS:
-        assert title in view
-    assert "La Fed va tarde" in view  # el contenido de las secciones, no solo su título
+# Etiquetas que pone el bot; cualquier otro <> del mensaje debe venir escapado.
+BOT_TAGS = ("<blockquote expandable>", "</blockquote>", "<b>", "</b>")
 
 
-def test_the_compact_view_leaves_the_detail_sections_out():
-    view = compact_block_view(make_block())
-
-    for title in set(FULL_BLOCK_SECTIONS) - set(COMPACT_BLOCK_SECTIONS):
-        assert title not in view
-
-
-def test_the_full_view_shows_every_section_present_in_the_extraction():
-    view = full_block_view(make_block())
-
-    for title in FULL_BLOCK_SECTIONS:
-        assert title in view
-    assert "El último kilómetro es el más caro." in view
-    assert "La inflación subyacente en 2026." in view  # el tema sigue en el encabezado
+def strip_bot_tags(message: str) -> str:
+    for tag in BOT_TAGS:
+        message = message.replace(tag, "")
+    return message
 
 
-def test_the_views_skip_sections_missing_from_the_extraction():
-    block = make_block(
-        extraction='### Tema del bloque\nSolo tema.\n\n### Citas textuales destacadas\n- "c"\n'
+def test_a_block_message_is_a_bold_heading_plus_an_expandable_quote():
+    messages = build_block_message("[00:10] La Fed", "- Va tarde.")
+
+    assert messages == ["<b>[00:10] La Fed</b>\n<blockquote expandable>- Va tarde.</blockquote>"]
+
+
+def test_llm_text_is_escaped_and_only_bot_tags_survive():
+    messages = build_block_message(
+        "[00:10] Tema <b>tramposo</b>", "1 < 2 & 3 > 0, y un <i>guiño</i> al parser"
     )
 
-    compact = compact_block_view(block)
-    full = full_block_view(block)
-
-    assert "Solo tema." in compact
-    for title in COMPACT_BLOCK_SECTIONS:
-        assert title not in compact  # ausentes en la extracción: ni título ni hueco
-    assert "Citas textuales destacadas" in full
-
-
-def test_clip_message_leaves_short_texts_alone_and_clips_long_ones_within_the_limit():
-    assert clip_message("texto corto") == "texto corto"
-
-    clipped = clip_message("palabra " * 1000, limit=100)
-
-    assert len(clipped) <= 100
-    assert "recortado" in clipped  # el recorte se declara, no se disimula
+    [message] = messages
+    assert "&lt;b&gt;tramposo&lt;/b&gt;" in message  # el encabezado también se escapa
+    assert "1 &lt; 2 &amp; 3 &gt; 0" in message
+    stripped = strip_bot_tags(message)
+    assert "<" not in stripped
+    assert ">" not in stripped
 
 
-# --------------------------------------------------------------------------------------
-# El toggle expandir/contraer: botón y callback_data en ambos sentidos
-# --------------------------------------------------------------------------------------
+def test_a_block_the_reduce_left_empty_sends_only_its_heading():
+    assert build_block_message("[00:00] Tema", "") == ["<b>[00:00] Tema</b>"]
 
 
-def test_the_collapsed_view_button_offers_the_full_detail():
-    button = block_keyboard("req12345", 3, expanded=False).inline_keyboard[0][0]
+def test_long_bodies_are_split_raw_first_so_no_entity_is_cut():
+    body = " y ".join(f"dato&cifra<{index}>" for index in range(200))
 
-    assert button.text == EXPAND_BUTTON_LABEL
-    assert button.callback_data == "blk:req12345:3:full"
+    messages = build_block_message("[00:00] Datos", body, limit=300)
 
-
-def test_the_expanded_view_button_offers_going_back_to_compact():
-    button = block_keyboard("req12345", 3, expanded=True).inline_keyboard[0][0]
-
-    assert button.text == COLLAPSE_BUTTON_LABEL
-    assert button.callback_data == "blk:req12345:3:compact"
-
-
-@pytest.mark.parametrize("expanded", [False, True])
-def test_the_callback_data_round_trips_and_asks_for_the_opposite_view(expanded):
-    data = block_keyboard("abc", 7, expanded=expanded).inline_keyboard[0][0].callback_data
-
-    request_id, index, wants_full = parse_block_callback(data)
-
-    assert (request_id, index) == ("abc", 7)
-    assert wants_full is not expanded  # el botón siempre lleva a la vista contraria
+    assert len(messages) > 1
+    assert all(len(message) <= 300 for message in messages)
+    # Ninguna entidad partida ni ningún & crudo en ningún trozo.
+    assert all(re.search(r"&(?!amp;|lt;|gt;)", message) is None for message in messages)
+    # Cada trozo va en su propia cita expandible y el conjunto reconstruye el original.
+    inner_parts = []
+    for message in messages:
+        quote = message.split("</b>\n")[-1]
+        assert quote.startswith("<blockquote expandable>")
+        assert quote.endswith("</blockquote>")
+        inner = quote.removeprefix("<blockquote expandable>").removesuffix("</blockquote>")
+        inner_parts.append(html.unescape(inner))
+    assert "".join(inner_parts) == body
 
 
-@pytest.mark.parametrize(
-    "data",
-    ["otra:cosa", "blk:req:no-numero:full", "blk:req:1:jpg", "blk:sin-partes", ""],
-)
-def test_a_callback_that_is_not_a_block_toggle_is_rejected(data):
-    with pytest.raises(ValueError):
-        parse_block_callback(data)
+def test_the_report_is_delivered_as_panorama_blocks_and_conclusions_with_footer():
+    result = make_result(summary=SAMPLE_REPORT)
+
+    messages = build_report_messages(result, make_settings())
+
+    assert len(messages) == 4  # panorama + 2 bloques + cierre
+    assert "Panorama" in messages[0]
+    assert messages[1].startswith("<b>[00:00] Contexto de inflación</b>")
+    assert "<blockquote expandable>" in messages[1]
+    assert "<blockquote expandable>" in messages[2]
+    assert "Tesis y conclusiones" in messages[3]
+    # El pie (bloques/tokens/coste) va SOLO en el último mensaje.
+    assert "9 bloques" in messages[3]
+    assert "111.000 tokens" in messages[3]
+    assert all("📊" not in message for message in messages[:-1])
 
 
-def test_the_block_store_evicts_the_oldest_request_beyond_the_limit():
-    store: dict[str, list[tuple[str, str]]] = {}
+def test_the_conclusions_message_bolds_its_subsections_and_escapes_the_rest():
+    result = make_result(summary=SAMPLE_REPORT)
 
-    for number in range(5):
-        store_block_views(store, f"req{number}", [("compacta", "completa")], max_requests=3)
+    closing = build_report_messages(result, make_settings())[-1]
 
-    assert list(store) == ["req2", "req3", "req4"]  # FIFO: caen los más antiguos
+    assert "<b>Tesis principales</b>" in closing  # las líneas ### se convierten en negrita
+    assert "### " not in strip_bot_tags(closing)
+    assert "<" not in strip_bot_tags(closing)
+
+
+def test_a_summary_without_the_expected_headings_falls_back_to_the_escaped_raw_text():
+    result = make_result(summary="informe <crudo> & sin estructura")
+
+    messages = build_report_messages(result, make_settings())
+
+    assert "informe &lt;crudo&gt; &amp; sin estructura" in messages[0]
+    assert "9 bloques" in messages[-1]  # el pie no se pierde ni en el fallback
+    assert all("<blockquote" not in message for message in messages)
+
+
+def test_a_report_without_conclusions_still_delivers_the_footer_at_the_end():
+    result = make_result(summary="## [00:00] Único bloque\n- Una idea.\n")
+
+    messages = build_report_messages(result, make_settings())
+
+    assert messages[0].startswith("<b>[00:00] Único bloque</b>")
+    assert "9 bloques" in messages[-1]
+    assert "<blockquote" not in messages[-1]  # el pie no viaja escondido en una cita
 
 
 # --------------------------------------------------------------------------------------
