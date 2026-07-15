@@ -1,27 +1,41 @@
 """Tests de la lógica pura de `macrobot.bot`.
 
-Todo lo que aquí se prueba son funciones sin SDK de Telegram, sin red y sin mocks: el
-troceo del informe al límite de 4096, la traducción de excepciones a mensajes de usuario
-y el pie con el coste estimado. La integración con python-telegram-bot (handlers,
-polling) es una capa fina que no se cubre con unitarios.
+Todo lo que aquí se prueba son funciones sin SDK real de Telegram, sin red y sin mocks:
+el troceo del informe al límite de 4096, la traducción de excepciones a mensajes de
+usuario, el pie con el coste estimado, el parseo de una extracción del map en sus
+apartados `###`, las vistas compacta/completa de cada bloque y el toggle del botón
+inline (que solo construye objetos de datos del SDK, sin red). La integración con
+python-telegram-bot (handlers, polling) es una capa fina que no se cubre con unitarios.
 """
 
 import pytest
 
 from macrobot.bot import (
+    COLLAPSE_BUTTON_LABEL,
+    COMPACT_BLOCK_SECTIONS,
+    EXPAND_BUTTON_LABEL,
+    FULL_BLOCK_SECTIONS,
     LLM_ERROR_MESSAGE,
     NO_SUBTITLES_MESSAGE,
     TELEGRAM_MAX_CHARS,
     UNEXPECTED_ERROR_MESSAGE,
     VIDEO_ERROR_MESSAGE,
+    block_keyboard,
     build_footer,
+    clip_message,
+    compact_block_view,
     error_message,
     estimate_cost,
+    full_block_view,
+    parse_block_callback,
+    parse_extraction,
     split_message,
+    store_block_views,
 )
 from macrobot.config import Settings
 from macrobot.llm import LLMError, LLMRateLimitError, TokenUsage
-from macrobot.pipeline import SummaryResult
+from macrobot.pipeline import BlockSummary, SummaryResult
+from macrobot.prompts import MAP_SECTION_TITLES
 from macrobot.transcript import NoSubtitlesError, TranscriptError, find_youtube_url
 
 
@@ -34,6 +48,7 @@ def make_settings(**overrides) -> Settings:
 def make_result(**overrides) -> SummaryResult:
     values = {
         "summary": "el informe",
+        "blocks": [],
         "chunk_count": 9,
         "map_model": "barato/mapa",
         "reduce_model": "bueno/informe",
@@ -43,6 +58,47 @@ def make_result(**overrides) -> SummaryResult:
     }
     values.update(overrides)
     return SummaryResult(**values)
+
+
+# Una extracción de ejemplo con TODOS los apartados del esquema de MAP_SYSTEM.
+FULL_EXTRACTION = """\
+[00:10:00 - 00:20:00]
+
+### Tema del bloque
+La inflación subyacente en 2026.
+
+### Tesis / ideas centrales
+- La Fed va tarde, según el ponente.
+
+### Argumentos y razonamiento
+- Los alquileres entran con retraso de un año en el IPC.
+
+### Datos y cifras citados
+- IPC subyacente 3,1 % interanual (mayo 2026).
+
+### Predicciones / escenarios
+- Si el IPC baja de 3 %, recorte en septiembre.
+
+### Activos / mercados / tickers
+- Bonos del Tesoro a 10 años: alcista.
+
+### Política monetaria / bancos centrales
+- La Fed mantiene tipos en 4,25-4,50 %.
+
+### Citas textuales destacadas
+- "El último kilómetro es el más caro."
+
+### Términos y conceptos clave
+- Efecto base: distorsión interanual por el año anterior.
+"""
+
+
+def make_block(
+    index: int = 0,
+    timespan: str = "00:10:00 - 00:20:00",
+    extraction: str = FULL_EXTRACTION,
+) -> BlockSummary:
+    return BlockSummary(index=index, timespan=timespan, extraction=extraction)
 
 
 # --------------------------------------------------------------------------------------
@@ -128,6 +184,151 @@ def test_split_message_does_not_cut_inside_a_code_block():
     assert "".join(parts) == text
     assert all(len(part) <= 45 for part in parts)
     assert all(part.count("```") % 2 == 0 for part in parts)
+
+
+# --------------------------------------------------------------------------------------
+# Parseo de una extracción del map en sus apartados ###
+# --------------------------------------------------------------------------------------
+
+
+def test_parse_extraction_finds_every_section_of_a_complete_extraction():
+    sections = parse_extraction(FULL_EXTRACTION)
+
+    assert set(sections) == set(MAP_SECTION_TITLES)
+    assert sections["Tema del bloque"] == "La inflación subyacente en 2026."
+    assert "IPC subyacente 3,1 % interanual" in sections["Datos y cifras citados"]
+
+
+def test_parse_extraction_ignores_the_leading_timespan_line():
+    sections = parse_extraction(FULL_EXTRACTION)
+
+    assert all("[00:10:00 - 00:20:00]" not in content for content in sections.values())
+
+
+def test_parse_extraction_treats_missing_sections_as_absent_without_failing():
+    partial = "### Tema del bloque\nEl petróleo.\n\n### Datos y cifras citados\n- Brent a 92 $.\n"
+
+    sections = parse_extraction(partial)
+
+    assert sections == {
+        "Tema del bloque": "El petróleo.",
+        "Datos y cifras citados": "- Brent a 92 $.",
+    }
+
+
+def test_parse_extraction_drops_sections_the_model_left_empty():
+    text = '### Tema del bloque\n\n### Citas textuales destacadas\n- "una cita"\n'
+
+    sections = parse_extraction(text)
+
+    assert "Tema del bloque" not in sections
+    assert sections["Citas textuales destacadas"] == '- "una cita"'
+
+
+def test_parse_extraction_of_prose_without_headings_yields_no_sections():
+    assert parse_extraction("el modelo se saltó el esquema y respondió en prosa") == {}
+
+
+# --------------------------------------------------------------------------------------
+# Vistas compacta y completa de un bloque
+# --------------------------------------------------------------------------------------
+
+
+def test_the_compact_view_shows_header_topic_and_the_compact_sections():
+    view = compact_block_view(make_block(index=2))
+
+    assert "Bloque 3" in view  # índice 0-based, numeración 1-based de cara al usuario
+    assert "00:10:00 - 00:20:00" in view
+    assert "La inflación subyacente en 2026." in view
+    for title in COMPACT_BLOCK_SECTIONS:
+        assert title in view
+    assert "La Fed va tarde" in view  # el contenido de las secciones, no solo su título
+
+
+def test_the_compact_view_leaves_the_detail_sections_out():
+    view = compact_block_view(make_block())
+
+    for title in set(FULL_BLOCK_SECTIONS) - set(COMPACT_BLOCK_SECTIONS):
+        assert title not in view
+
+
+def test_the_full_view_shows_every_section_present_in_the_extraction():
+    view = full_block_view(make_block())
+
+    for title in FULL_BLOCK_SECTIONS:
+        assert title in view
+    assert "El último kilómetro es el más caro." in view
+    assert "La inflación subyacente en 2026." in view  # el tema sigue en el encabezado
+
+
+def test_the_views_skip_sections_missing_from_the_extraction():
+    block = make_block(
+        extraction='### Tema del bloque\nSolo tema.\n\n### Citas textuales destacadas\n- "c"\n'
+    )
+
+    compact = compact_block_view(block)
+    full = full_block_view(block)
+
+    assert "Solo tema." in compact
+    for title in COMPACT_BLOCK_SECTIONS:
+        assert title not in compact  # ausentes en la extracción: ni título ni hueco
+    assert "Citas textuales destacadas" in full
+
+
+def test_clip_message_leaves_short_texts_alone_and_clips_long_ones_within_the_limit():
+    assert clip_message("texto corto") == "texto corto"
+
+    clipped = clip_message("palabra " * 1000, limit=100)
+
+    assert len(clipped) <= 100
+    assert "recortado" in clipped  # el recorte se declara, no se disimula
+
+
+# --------------------------------------------------------------------------------------
+# El toggle expandir/contraer: botón y callback_data en ambos sentidos
+# --------------------------------------------------------------------------------------
+
+
+def test_the_collapsed_view_button_offers_the_full_detail():
+    button = block_keyboard("req12345", 3, expanded=False).inline_keyboard[0][0]
+
+    assert button.text == EXPAND_BUTTON_LABEL
+    assert button.callback_data == "blk:req12345:3:full"
+
+
+def test_the_expanded_view_button_offers_going_back_to_compact():
+    button = block_keyboard("req12345", 3, expanded=True).inline_keyboard[0][0]
+
+    assert button.text == COLLAPSE_BUTTON_LABEL
+    assert button.callback_data == "blk:req12345:3:compact"
+
+
+@pytest.mark.parametrize("expanded", [False, True])
+def test_the_callback_data_round_trips_and_asks_for_the_opposite_view(expanded):
+    data = block_keyboard("abc", 7, expanded=expanded).inline_keyboard[0][0].callback_data
+
+    request_id, index, wants_full = parse_block_callback(data)
+
+    assert (request_id, index) == ("abc", 7)
+    assert wants_full is not expanded  # el botón siempre lleva a la vista contraria
+
+
+@pytest.mark.parametrize(
+    "data",
+    ["otra:cosa", "blk:req:no-numero:full", "blk:req:1:jpg", "blk:sin-partes", ""],
+)
+def test_a_callback_that_is_not_a_block_toggle_is_rejected(data):
+    with pytest.raises(ValueError):
+        parse_block_callback(data)
+
+
+def test_the_block_store_evicts_the_oldest_request_beyond_the_limit():
+    store: dict[str, list[tuple[str, str]]] = {}
+
+    for number in range(5):
+        store_block_views(store, f"req{number}", [("compacta", "completa")], max_requests=3)
+
+    assert list(store) == ["req2", "req3", "req4"]  # FIFO: caen los más antiguos
 
 
 # --------------------------------------------------------------------------------------

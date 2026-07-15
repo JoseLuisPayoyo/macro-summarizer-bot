@@ -16,6 +16,21 @@ aunque la charla de origen esté en inglés. Los helpers `build_*_user_prompt` s
 funciones puras: montan el mensaje de usuario y mantienen separado el system del user.
 """
 
+# Títulos de los apartados ### del esquema de MAP_SYSTEM, en su orden. Es el contrato
+# con el que `bot` parsea cada extracción para las vistas compacta/completa; el test de
+# prompts vigila que no diverja del texto del prompt.
+MAP_SECTION_TITLES = (
+    "Tema del bloque",
+    "Tesis / ideas centrales",
+    "Argumentos y razonamiento",
+    "Datos y cifras citados",
+    "Predicciones / escenarios",
+    "Activos / mercados / tickers",
+    "Política monetaria / bancos centrales",
+    "Citas textuales destacadas",
+    "Términos y conceptos clave",
+)
+
 MAP_SYSTEM = """\
 Eres un analista de macroeconomía. Recibes UN bloque de la transcripción de una charla \
 larga en inglés, encabezado por su rango temporal. Tu trabajo es EXTRAER información \

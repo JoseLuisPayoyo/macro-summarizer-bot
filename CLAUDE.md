@@ -42,7 +42,9 @@ URL de YouTube
    │     ejecutivo + índice de bloques) que orienta antes de las extracciones.
    │
    └─ 5. ENTREGA  (bot.py)
-         El resumen se trocea a 4096 caracteres (límite de Telegram) y se envía.
+         Primero la visión general del reduce; después un mensaje por bloque en vista
+         compacta con botón inline para expandir/contraer el detalle completo. Todo
+         troceado a 4096 caracteres (límite de Telegram).
 ```
 
 Todas las llamadas a LLM van por **OpenRouter** (`llm.py` es el único módulo que habla con
@@ -135,16 +137,21 @@ Implementados y cubiertos con tests:
   con prohibición explícita de relleno y "voz de IA") y `REDUCE_SYSTEM` (SOLO visión
   general: resumen ejecutivo + índice de bloques; ya no reescribe el contenido), con los
   helpers puros `build_map_user_prompt` / `build_reduce_user_prompt` (fase 2, revisados
-  después de la fase 4). OJO: `pipeline`/`bot` aún entregan solo la salida del reduce;
-  entregar además las extracciones como cuerpo del informe está pendiente de cablear.
+  después de la fase 4). La tupla `MAP_SECTION_TITLES` expone los títulos `###` del
+  esquema: es el contrato con el que `bot` parsea cada extracción, y un test de prompts
+  vigila que no diverja del texto de `MAP_SYSTEM`.
 - `pipeline.py` — `summarize(url, client, settings, progress=None)` orquesta
   transcripción -> troceo -> map en paralelo (semáforo de `max_concurrency`) -> reduce, y
-  devuelve `SummaryResult` con el uso de tokens desglosado map/reduce/total (fase 3).
+  devuelve `SummaryResult` con el uso de tokens desglosado map/reduce/total (fase 3) y
+  `blocks: list[BlockSummary]` (`index` cronológico desde 0, `timespan` del Chunk y
+  `extraction` tal cual salió del map): las extracciones por bloque que el bot entrega
+  como cuerpo del informe.
 - `config.py` — completo, incluido `get_settings()` (única instancia, con `lru_cache`).
 - `bot.py` — la aplicación de python-telegram-bot en polling y el entry point
   `uv run macrobot` (fase 4). La lógica pura (troceo a 4096, traducción de errores,
-  coste estimado, pie del informe) está separada de los handlers y cubierta por tests;
-  los handlers son capa fina sin cobertura unitaria, a propósito.
+  coste estimado, pie del informe, parseo de extracciones, vistas de bloque y toggle)
+  está separada de los handlers y cubierta por tests; los handlers son capa fina sin
+  cobertura unitaria, a propósito.
 
 Sigue como stub (`raise NotImplementedError`): `whisper.py`.
 
@@ -161,6 +168,18 @@ Decisiones de la capa de Telegram (fase 4):
 - El informe se envía como TEXTO PLANO (sin `parse_mode`): el Markdown que genera un LLM
   rompe el parser de entidades de Telegram con facilidad, y un informe feo es mejor que
   un informe que no llega.
+- ENTREGA POR BLOQUES: primero la visión general del reduce (resumen ejecutivo + índice,
+  con el pie), y después un mensaje por `BlockSummary` en vista COMPACTA (tema en el
+  encabezado + tesis, datos y predicciones) con un botón inline "🔽 Ver detalle completo".
+  El `CallbackQueryHandler` alterna a la vista completa (todos los apartados) y de vuelta
+  ("🔼 Ver menos"). Las vistas salen de parsear la extracción por los títulos de
+  `MAP_SECTION_TITLES` — sin volver a llamar al LLM — y un apartado ausente se omite,
+  nunca es error. El callback se responde SIEMPRE (`answer`), aunque sea en vacío.
+- Las dos vistas de cada bloque se guardan en `bot_data["block_views"]` por request_id
+  (uuid corto), en una cola FIFO de máx. 20 informes; un toggle de un informe desalojado
+  (o de antes de un reinicio) responde con un aviso. La vista expandida se muestra
+  EDITANDO el mensaje, así que no puede trocearse: `clip_message` la recorta a 4096
+  declarando el recorte.
 - `split_message` corta por párrafo > línea > espacio, nunca a media palabra, y evita
   partir bloques de código (paridad de vallas ```) mientras sea posible; la concatenación
   de los trozos reconstruye el original byte a byte.

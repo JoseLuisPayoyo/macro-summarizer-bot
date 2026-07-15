@@ -13,9 +13,11 @@ Flujo:
    OpenRouter. Las extracciones se conservan en el orden cronológico de los bloques.
    Si un bloque falla tras agotar los reintentos del cliente, el fallo se PROPAGA:
    mejor ningún informe que un informe con un bloque perdido en silencio.
-4. REDUCE: una única llamada al modelo bueno (`reduce_model`) con todo concatenado.
-5. `SummaryResult`: el informe más el uso de tokens desglosado en map/reduce/total, para
-   poder vigilar el objetivo de coste (<0,10 $/vídeo).
+4. REDUCE: una única llamada al modelo bueno (`reduce_model`) con todo concatenado, que
+   produce solo la visión general breve (las extracciones son el cuerpo del informe).
+5. `SummaryResult`: la visión general, las extracciones por bloque (`blocks`, en orden
+   cronológico y con su rango temporal) y el uso de tokens desglosado en
+   map/reduce/total, para poder vigilar el objetivo de coste (<0,10 $/vídeo).
 
 El progreso se comunica con un callback opcional —síncrono o asíncrono, da igual— para
 que el bot vaya editando su mensaje de estado sin que este módulo dependa de Telegram.
@@ -42,10 +44,24 @@ ProgressCallback = Callable[[str], Awaitable[None] | None]
 
 
 @dataclass(frozen=True, slots=True)
+class BlockSummary:
+    """La extracción de UN bloque, tal cual la devolvió el map, con su posición y rango."""
+
+    index: int  # orden cronológico, empezando en 0
+    timespan: str  # el rango "HH:MM:SS - HH:MM:SS" del Chunk
+    extraction: str
+
+
+@dataclass(frozen=True, slots=True)
 class SummaryResult:
-    """Resultado final del pipeline para un vídeo."""
+    """Resultado final del pipeline para un vídeo.
+
+    `summary` es la visión general breve del reduce; `blocks` conserva las extracciones
+    del map en orden cronológico, porque son el cuerpo real del informe que entrega el bot.
+    """
 
     summary: str
+    blocks: list[BlockSummary]
     chunk_count: int
     map_model: str
     reduce_model: str
@@ -147,6 +163,10 @@ async def summarize(
 
     return SummaryResult(
         summary=reduce_result.text,
+        blocks=[
+            BlockSummary(index=chunk.index, timespan=chunk.timespan, extraction=extraction)
+            for chunk, extraction in zip(chunks, extractions, strict=True)
+        ],
         chunk_count=len(chunks),
         map_model=settings.map_model,
         reduce_model=settings.reduce_model,

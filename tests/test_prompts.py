@@ -8,6 +8,7 @@ contenido), que ambos prohíban el lenguaje de relleno, y que los helpers de for
 """
 
 from macrobot.prompts import (
+    MAP_SECTION_TITLES,
     MAP_SYSTEM,
     REDUCE_SYSTEM,
     build_map_user_prompt,
@@ -59,6 +60,12 @@ FILLER_PHRASES = [
 def test_map_system_lists_every_extraction_section():
     for section in MAP_SECTIONS:
         assert section in MAP_SYSTEM, f"falta el apartado {section!r}"
+
+
+def test_map_section_titles_constant_matches_the_fixed_schema():
+    # `bot` parsea las extracciones con esta constante: si diverge del esquema, el
+    # informe por bloques se quedaría en blanco en silencio.
+    assert [f"### {title}" for title in MAP_SECTION_TITLES] == MAP_SECTIONS
 
 
 def test_map_system_orders_extraction_not_paraphrase():

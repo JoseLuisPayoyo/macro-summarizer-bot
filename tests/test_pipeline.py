@@ -185,6 +185,32 @@ async def test_token_usage_is_aggregated_and_broken_down(monkeypatch):
 
 
 # --------------------------------------------------------------------------------------
+# Las extracciones por bloque se conservan en el resultado
+# --------------------------------------------------------------------------------------
+
+
+async def test_the_result_carries_one_block_summary_per_chunk_in_order(monkeypatch):
+    install_transcript(monkeypatch, make_segments("bloque A", "bloque B", "bloque C"))
+    # Terminación en orden inverso: el orden de `blocks` debe ser el cronológico igualmente.
+    client = FakeLLMClient(map_delays={0: 0.06, 1: 0.03, 2: 0.0})
+
+    result = await summarize(URL, client, make_settings(max_concurrency=3))
+
+    assert client.completion_order == [2, 1, 0]  # sanidad: terminaron de verdad al revés
+    assert len(result.blocks) == result.chunk_count == 3
+    assert [block.index for block in result.blocks] == [0, 1, 2]
+    assert [block.timespan for block in result.blocks] == [
+        "00:00:00 - 00:00:05",
+        "00:10:00 - 00:10:05",
+        "00:20:00 - 00:20:05",
+    ]
+    # La extracción es el texto que devolvió el map para ESE bloque, tal cual.
+    for block, text in zip(result.blocks, ["bloque A", "bloque B", "bloque C"], strict=True):
+        assert block.extraction.startswith("EXTRACCIÓN<")
+        assert text in block.extraction
+
+
+# --------------------------------------------------------------------------------------
 # Orden y concurrencia
 # --------------------------------------------------------------------------------------
 

@@ -12,9 +12,20 @@ Detalles de la capa de Telegram que resuelve este módulo:
 - El pipeline tarda minutos: se responde con UN mensaje de estado que se va EDITANDO con
   los hitos del `progress` del pipeline. Una edición que falle (rate limit de Telegram,
   texto idéntico...) se ignora: el progreso es cosmético y no debe tumbar el resumen.
+- La entrega es POR BLOQUES: primero la visión general del reduce (resumen ejecutivo +
+  índice) y después un mensaje por bloque en vista compacta (tema, tesis, datos y
+  predicciones) con un botón inline que expande/contrae el detalle completo. Las vistas
+  salen de parsear la extracción del map por sus apartados `###` (sin volver a llamar al
+  LLM); un apartado que falte se trata como ausente, nunca como error.
+- El toggle necesita las dos vistas de cada bloque a mano cuando llega el callback: se
+  guardan en `bot_data` por request_id, con una cola FIFO acotada para que un proceso de
+  semanas no acumule memoria sin límite (un toggle de un informe ya desalojado responde
+  con un aviso, no con un fallo).
 - El informe de una charla larga supera el límite de 4096 caracteres por mensaje:
   `split_message` lo trocea cortando por párrafos/líneas/espacios, nunca a media palabra
-  y evitando (mientras se pueda) partir un bloque de código por la mitad.
+  y evitando (mientras se pueda) partir un bloque de código por la mitad. Lo que se
+  muestra EDITANDO un mensaje (la vista expandida) no puede trocearse: `clip_message` lo
+  recorta declarándolo.
 - Los errores del contrato del pipeline se traducen a mensajes de usuario en español
   (`error_message`); el detalle técnico va al log, nunca al chat.
 
@@ -22,11 +33,13 @@ Todos los textos de cara al usuario van en español.
 """
 
 import logging
+from uuid import uuid4
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -35,7 +48,8 @@ from telegram.ext import (
 
 from macrobot.config import Settings, get_settings
 from macrobot.llm import LLMError, OpenRouterClient
-from macrobot.pipeline import SummaryResult, summarize
+from macrobot.pipeline import BlockSummary, SummaryResult, summarize
+from macrobot.prompts import MAP_SECTION_TITLES
 from macrobot.transcript import NoSubtitlesError, TranscriptError, find_youtube_url
 
 logger = logging.getLogger(__name__)
@@ -79,6 +93,27 @@ UNEXPECTED_ERROR_MESSAGE = (
     "❌ Algo ha salido mal procesando el vídeo. Inténtalo de nuevo y, si se repite, avisa "
     "a quien administre el bot."
 )
+
+EXPAND_BUTTON_LABEL = "🔽 Ver detalle completo"
+COLLAPSE_BUTTON_LABEL = "🔼 Ver menos"
+EXPIRED_BLOCKS_ANSWER = "Ya no guardo el detalle de este informe. Pídeme el resumen otra vez."
+
+# El "Tema del bloque" no es una sección de las vistas: va en el encabezado del mensaje.
+_TOPIC_SECTION = MAP_SECTION_TITLES[0]
+
+# Vista compacta (la que se manda por defecto): lo esencial de cada bloque.
+COMPACT_BLOCK_SECTIONS = (
+    "Tesis / ideas centrales",
+    "Datos y cifras citados",
+    "Predicciones / escenarios",
+)
+
+# Vista completa (al pulsar el botón): todos los apartados del esquema del map.
+FULL_BLOCK_SECTIONS = tuple(title for title in MAP_SECTION_TITLES if title != _TOPIC_SECTION)
+
+_CALLBACK_PREFIX = "blk"  # callback_data: "blk:<request_id>:<índice>:<full|compact>"
+_BLOCK_VIEWS_KEY = "block_views"  # clave en bot_data del almacén de vistas por request
+_MAX_STORED_REQUESTS = 20  # informes cuyos toggles siguen vivos; más allá, FIFO
 
 
 # --------------------------------------------------------------------------------------
@@ -167,6 +202,103 @@ def build_footer(result: SummaryResult, settings: Settings) -> str:
     return "\n\n📊 " + " · ".join(pieces)
 
 
+def parse_extraction(extraction: str) -> dict[str, str]:
+    """Trocea una extracción del map en sus apartados: título `###` -> contenido.
+
+    El LLM no es 100% determinista: un apartado que falte, que llegue vacío o con otro
+    título simplemente no aparece en el resultado. Lo anterior al primer `###` (la línea
+    del rango temporal) se descarta: el rango ya viaja en `BlockSummary.timespan`.
+    """
+    sections: dict[str, str] = {}
+    current: str | None = None
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if current is not None and (content := "\n".join(buffer).strip()):
+            sections[current] = content
+
+    for line in extraction.splitlines():
+        if line.startswith("### "):
+            flush()
+            current = line.removeprefix("### ").strip()
+            buffer = []
+        else:
+            buffer.append(line)
+    flush()
+    return sections
+
+
+def _render_block(block: BlockSummary, titles: tuple[str, ...]) -> str:
+    """Encabezado (número, rango y tema) más los apartados pedidos que existan."""
+    sections = parse_extraction(block.extraction)
+    header = f"🧩 Bloque {block.index + 1} · [{block.timespan}]"
+    if topic := sections.get(_TOPIC_SECTION):
+        header += f"\n{topic}"
+    pieces = [header]
+    pieces += [f"▫️ {title}\n{content}" for title in titles if (content := sections.get(title))]
+    return "\n\n".join(pieces)
+
+
+def compact_block_view(block: BlockSummary) -> str:
+    """La vista por defecto de un bloque: tema, tesis, datos y predicciones."""
+    return _render_block(block, COMPACT_BLOCK_SECTIONS)
+
+
+def full_block_view(block: BlockSummary) -> str:
+    """La vista expandida: todos los apartados del esquema presentes en la extracción."""
+    return _render_block(block, FULL_BLOCK_SECTIONS)
+
+
+def clip_message(text: str, limit: int = TELEGRAM_MAX_CHARS) -> str:
+    """Recorta un texto a UN mensaje de Telegram, con corte limpio y aviso del recorte.
+
+    Para texto que se muestra editando un mensaje ya enviado (la vista expandida), donde
+    trocear en varios mensajes no es una opción.
+    """
+    if len(text) <= limit:
+        return text
+    notice = "\n\n… (recortado: el detalle completo no cabe en un mensaje de Telegram)"
+    cut = _cut_point(text, limit - len(notice))
+    return text[:cut].rstrip() + notice
+
+
+def block_keyboard(request_id: str, index: int, *, expanded: bool) -> InlineKeyboardMarkup:
+    """El botón inline de un bloque: siempre ofrece la vista contraria a la mostrada."""
+    if expanded:
+        label, target = COLLAPSE_BUTTON_LABEL, "compact"
+    else:
+        label, target = EXPAND_BUTTON_LABEL, "full"
+    callback_data = f"{_CALLBACK_PREFIX}:{request_id}:{index}:{target}"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=callback_data)]])
+
+
+def parse_block_callback(data: str) -> tuple[str, int, bool]:
+    """Descompone el callback_data de un botón de bloque: (request_id, índice, ¿a completa?).
+
+    Lanza `ValueError` si el dato no es un toggle de bloque bien formado.
+    """
+    prefix, request_id, index, target = data.split(":")  # ValueError si no son 4 partes
+    if prefix != _CALLBACK_PREFIX or target not in ("full", "compact"):
+        raise ValueError(f"callback_data desconocido: {data!r}")
+    return request_id, int(index), target == "full"
+
+
+def store_block_views(
+    store: dict[str, list[tuple[str, str]]],
+    request_id: str,
+    views: list[tuple[str, str]],
+    max_requests: int = _MAX_STORED_REQUESTS,
+) -> None:
+    """Guarda las vistas (compacta, completa) de un informe y desaloja las más antiguas.
+
+    El almacén es un dict ordenado por inserción: pasado `max_requests`, cae el informe
+    más antiguo y sus botones responden con `EXPIRED_BLOCKS_ANSWER` en vez de romperse.
+    """
+    store[request_id] = views
+    while len(store) > max_requests:
+        store.pop(next(iter(store)))
+
+
 # --------------------------------------------------------------------------------------
 # Handlers de Telegram
 # --------------------------------------------------------------------------------------
@@ -221,10 +353,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         result.total_usage.total_tokens,
     )
     await progress(DONE_MESSAGE)
-    report = result.summary + build_footer(result, settings)
-    for part in split_message(report):
+
+    # 1) La visión general del reduce (resumen ejecutivo + índice), con el pie.
+    overview = result.summary + build_footer(result, settings)
+    for part in split_message(overview):
         if part.strip():
             await message.reply_text(part)
+
+    # 2) Un mensaje por bloque, en vista compacta y con el botón de expandir. El toggle
+    # edita el ÚLTIMO mensaje del bloque, así que es esa parte la que se guarda como
+    # vista compacta; la expandida se recorta a un único mensaje editable.
+    request_id = uuid4().hex[:8]
+    views: list[tuple[str, str]] = []
+    for block in result.blocks:
+        parts = split_message(compact_block_view(block))
+        for part in parts[:-1]:
+            await message.reply_text(part)
+        compact = parts[-1]
+        await message.reply_text(
+            compact, reply_markup=block_keyboard(request_id, block.index, expanded=False)
+        )
+        views.append((compact, clip_message(full_block_view(block))))
+    store_block_views(context.bot_data.setdefault(_BLOCK_VIEWS_KEY, {}), request_id, views)
+
+
+async def handle_block_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler del botón de un bloque: alterna entre la vista compacta y la completa.
+
+    Siempre responde al callback (aunque sea en vacío) para que Telegram no deje el
+    reloj de carga colgado en el cliente.
+    """
+    query = update.callback_query
+    if query is None or query.data is None:
+        return
+
+    try:
+        request_id, index, wants_full = parse_block_callback(query.data)
+    except ValueError:
+        logger.debug("callback_data inesperado: %r", query.data)
+        await query.answer()
+        return
+
+    store: dict[str, list[tuple[str, str]]] = context.bot_data.get(_BLOCK_VIEWS_KEY, {})
+    views = store.get(request_id)
+    if views is None or not 0 <= index < len(views):
+        # El informe ya cayó de la cola FIFO (o el proceso se reinició): se avisa, no se rompe.
+        await query.answer(EXPIRED_BLOCKS_ANSWER, show_alert=True)
+        return
+
+    compact, full = views[index]
+    try:
+        await query.edit_message_text(
+            full if wants_full else compact,
+            reply_markup=block_keyboard(request_id, index, expanded=wants_full),
+        )
+    except TelegramError:
+        # Doble pulsación o rate limit: el botón es cosmético, el informe ya está entregado.
+        logger.debug("No se pudo editar el mensaje del bloque", exc_info=True)
+    await query.answer()
 
 
 # --------------------------------------------------------------------------------------
@@ -245,6 +431,9 @@ def build_application(settings: Settings, client: OpenRouterClient) -> Applicati
     application.bot_data["client"] = client
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(
+        CallbackQueryHandler(handle_block_toggle, pattern=rf"^{_CALLBACK_PREFIX}:")
+    )
     return application
 
 
