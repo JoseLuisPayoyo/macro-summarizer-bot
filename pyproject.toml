@@ -49,6 +49,11 @@ select = [
 ]
 ignore = [
     "ANN401",  # se permite Any explícito cuando sea necesario
+    # Usamos puntuación tipográfica a propósito en el texto de cara al usuario en español
+    # (guion largo "–" en los rangos, punto medio "·" en el pie): no son homóglifos por error.
+    "RUF001",  # carácter ambiguo en literal de cadena
+    "RUF002",  # carácter ambiguo en docstring
+    "RUF003",  # carácter ambiguo en comentario
 ]
 
 [tool.ruff.lint.per-file-ignores]

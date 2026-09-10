@@ -22,10 +22,12 @@ from macrobot.bot import (
     TELEGRAM_MAX_CHARS,
     UNEXPECTED_ERROR_MESSAGE,
     VIDEO_ERROR_MESSAGE,
+    _ranged_blocks,
     access_filter,
     build_application,
     build_block_message,
     build_footer,
+    build_group_messages,
     build_report_messages,
     error_message,
     estimate_cost,
@@ -271,20 +273,23 @@ def test_long_bodies_are_split_raw_first_so_no_entity_is_cut():
     assert "".join(inner_parts) == body
 
 
-def test_the_report_is_delivered_as_panorama_blocks_and_conclusions_with_footer():
+def test_the_report_is_delivered_as_panorama_group_and_conclusions_with_footer():
+    # Con blocks_per_message por defecto (4), los 2 bloques van en UN solo grupo.
     result = make_result(summary=SAMPLE_REPORT)
 
     messages = build_report_messages(result, make_settings())
 
-    assert len(messages) == 4  # panorama + 2 bloques + cierre
-    assert "Panorama" in messages[0]
-    assert messages[1].startswith("<b>[00:00] Contexto de inflación</b>")
-    assert "<blockquote expandable>" in messages[1]
-    assert "<blockquote expandable>" in messages[2]
-    assert "Tesis y conclusiones" in messages[3]
+    assert len(messages) == 3  # panorama + 1 grupo (2 bloques) + cierre
+    assert "🗺" in messages[0] and "Panorama" in messages[0]
+    # El grupo abre con su cabecera de rango y lleva los dos bloques, cada uno con su cita.
+    assert messages[1].startswith("<b>Bloques 1–2 · 00:00–10:00</b>")
+    assert messages[1].count("<blockquote expandable>") == 2
+    assert "<b>[00:00–10:00] Contexto de inflación</b>" in messages[1]
+    assert "<b>[10:00] La Fed</b>" in messages[1]  # el último bloque: inicio a secas
+    assert "🎯" in messages[2] and "Tesis y conclusiones" in messages[2]
     # El pie (bloques/tokens/coste) va SOLO en el último mensaje.
-    assert "9 bloques" in messages[3]
-    assert "111.000 tokens" in messages[3]
+    assert "9 bloques" in messages[2]
+    assert "111.000 tokens" in messages[2]
     assert all("📊" not in message for message in messages[:-1])
 
 
@@ -313,9 +318,138 @@ def test_a_report_without_conclusions_still_delivers_the_footer_at_the_end():
 
     messages = build_report_messages(result, make_settings())
 
-    assert messages[0].startswith("<b>[00:00] Único bloque</b>")
+    # Un único bloque también lleva su cabecera de grupo ("Bloque 1"), y luego el bloque.
+    assert messages[0].startswith("<b>Bloque 1 · 00:00</b>")
+    assert "<b>[00:00] Único bloque</b>" in messages[0]
     assert "9 bloques" in messages[-1]
     assert "<blockquote" not in messages[-1]  # el pie no viaja escondido en una cita
+
+
+# --------------------------------------------------------------------------------------
+# Agrupación de bloques en menos mensajes
+# --------------------------------------------------------------------------------------
+
+
+def report_with_blocks(count: int) -> str:
+    """Un informe (sin panorama ni cierre) con `count` bloques a intervalos de 10 min."""
+    lines: list[str] = []
+    for index in range(count):
+        lines.append(f"## [{index * 10:02d}:00] Tema {index + 1}")
+        lines.append(f"- Idea del bloque {index + 1}.")
+    return "\n".join(lines)
+
+
+def group_headers(messages: list[str]) -> list[str]:
+    """Los encabezados de grupo (`<b>Bloque…</b>`) que abren cada mensaje de grupo."""
+    return [m for m in messages if m.startswith(("<b>Bloque ", "<b>Bloques "))]
+
+
+@pytest.mark.parametrize(
+    ("count", "per_message", "expected_groups"),
+    [(9, 4, 3), (8, 4, 2), (6, 2, 3), (5, 5, 1), (3, 4, 1), (7, 3, 3)],
+)
+def test_blocks_are_grouped_according_to_blocks_per_message(count, per_message, expected_groups):
+    # Incluye el último grupo incompleto (p. ej. 9/4 -> 4+4+1).
+    result = make_result(summary=report_with_blocks(count))
+
+    messages = build_report_messages(result, make_settings(blocks_per_message=per_message))
+
+    assert len(group_headers(messages)) == expected_groups
+
+
+def test_a_group_header_shows_the_block_numbering_and_time_range():
+    result = make_result(summary=report_with_blocks(9))
+
+    messages = group_headers(build_report_messages(result, make_settings(blocks_per_message=4)))
+    headers = [message.split("\n", 1)[0] for message in messages]  # solo la línea de cabecera
+
+    # Grupo 1: bloques 1–4, de 00:00 al inicio del bloque 5 (40:00). Último: bloque 9 solo.
+    assert headers[0] == "<b>Bloques 1–4 · 00:00–40:00</b>"
+    assert headers[1] == "<b>Bloques 5–8 · 40:00–80:00</b>"
+    assert headers[2] == "<b>Bloque 9 · 80:00</b>"
+
+
+def test_each_block_keeps_its_own_expandable_quote_inside_the_group_message():
+    result = make_result(summary=report_with_blocks(4))
+
+    [message] = group_headers(build_report_messages(result, make_settings(blocks_per_message=4)))
+
+    # Un mensaje = cabecera + 4 citas independientes, separadas por la línea tenue.
+    assert message.count("<blockquote expandable>") == 4
+    assert message.count("</blockquote>") == 4
+    assert message.count("──────────") == 3  # divisores entre los 4 bloques
+    for index in range(1, 5):
+        assert "<b>[" in message and f"Tema {index}" in message
+
+
+def test_a_group_that_exceeds_the_limit_is_split_by_block_boundaries():
+    # 4 bloques que juntos superan el límite pero cada uno cabe de sobra en un mensaje.
+    body = "dato " * 300  # ~1500 chars por bloque -> ~6000 en el grupo
+    blocks = [(f"[{i * 10:02d}:00–{(i + 1) * 10:02d}:00] Tema {i + 1}", body) for i in range(4)]
+
+    messages = build_group_messages("Bloques 1–4 · 00:00–40:00", blocks)
+
+    assert len(messages) > 1  # no cabía en uno solo
+    assert all(len(message) <= TELEGRAM_MAX_CHARS for message in messages)
+    # Ningún bloque partido: la suma de citas es exactamente 4 y cada cuerpo está entero.
+    assert sum(m.count("<blockquote expandable>") for m in messages) == 4
+    assert sum(m.count("</blockquote>") for m in messages) == 4
+    for index in range(1, 5):
+        assert any(f"Tema {index}" in message for message in messages)
+
+
+def test_an_oversized_single_block_falls_back_to_internal_splitting():
+    # Un solo bloque que no cabe ni él solo: se trocea por dentro (troceo actual).
+    body = "palabra " * 2000  # muy por encima de 4096
+    messages = build_group_messages("Bloque 1 · 00:00", [("[00:00] Enorme", body)])
+
+    assert len(messages) > 1
+    assert all(len(message) <= TELEGRAM_MAX_CHARS for message in messages)
+    # El cuerpo se reconstruye byte a byte al desescapar y unir las citas.
+    inner = "".join(
+        html.unescape(part.split("<blockquote expandable>", 1)[1].removesuffix("</blockquote>"))
+        for message in messages
+        for part in [message]
+        if "<blockquote expandable>" in message
+    )
+    assert inner == body
+
+
+def test_ranged_blocks_builds_ranges_and_leaves_the_last_block_open():
+    ranged = _ranged_blocks(["[00:00] A", "[10:00] B", "[20:00] C"])
+
+    assert [block.title for block in ranged] == [
+        "[00:00–10:00] A",
+        "[10:00–20:00] B",
+        "[20:00] C",  # el último: inicio a secas, sin fin
+    ]
+
+
+def test_ranged_blocks_handles_the_hh_mm_ss_format():
+    ranged = _ranged_blocks(["[01:05:00] A", "[01:15:00] B"])
+
+    assert ranged[0].title == "[01:05:00–01:15:00] A"
+    assert ranged[1].title == "[01:15:00] B"
+
+
+def test_ranged_blocks_leaves_an_unparseable_heading_untouched():
+    ranged = _ranged_blocks(["sin marca de tiempo", "[05:00] B"])
+
+    assert ranged[0].title == "sin marca de tiempo"
+    assert ranged[0].start is None
+    assert ranged[1].title == "[05:00] B"  # se parsea, pero no hay bloque posterior
+
+
+def test_grouped_message_escapes_all_llm_text():
+    result = make_result(summary="## [00:00] Tema <b>x</b> & 1<2\n- cuerpo <i>y</i> & z>0\n")
+
+    [message] = group_headers(build_report_messages(result, make_settings()))
+
+    assert "&lt;b&gt;x&lt;/b&gt; &amp; 1&lt;2" in message  # el título del LLM va escapado
+    assert "cuerpo &lt;i&gt;y&lt;/i&gt; &amp; z&gt;0" in message
+    stripped = strip_bot_tags(message)
+    assert "<" not in stripped
+    assert ">" not in stripped
 
 
 # --------------------------------------------------------------------------------------

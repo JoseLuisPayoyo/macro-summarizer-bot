@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     max_concurrency: int = 5  # llamadas map simultáneas contra OpenRouter
     sub_langs: str = "en,en-US,en-GB"
 
+    # Bloques del informe que se agrupan en un mismo mensaje de Telegram. Reduce el número
+    # de mensajes (un vídeo de 2 h da ~12 bloques) SIN tocar el troceo del map. Agrupar más
+    # = menos mensajes pero cada uno más largo.
+    blocks_per_message: int = 4
+
     @property
     def sub_lang_list(self) -> list[str]:
         """`sub_langs` como lista de códigos de idioma, en orden de preferencia."""

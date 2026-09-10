@@ -13,11 +13,12 @@ Detalles de la capa de Telegram que resuelve este módulo:
   los hitos del `progress` del pipeline. Una edición que falle (rate limit de Telegram,
   texto idéntico...) se ignora: el progreso es cosmético y no debe tumbar el resumen.
 - La ENTREGA parsea la salida del reduce por su contrato de encabezados (`parse_report`)
-  y la envía en `parse_mode=HTML`: un mensaje con el Panorama, uno por bloque —encabezado
-  en negrita y contenido en `<blockquote expandable>`, que Telegram colapsa solo, sin
-  botones ni callbacks— y el cierre de tesis y conclusiones con el pie. Si el reduce se
-  desvía del contrato, se degrada al summary escapado y troceado: nunca se falla por
-  formato.
+  y la envía en `parse_mode=HTML`: un mensaje con el Panorama, los bloques AGRUPADOS de
+  `blocks_per_message` en `blocks_per_message` (cada grupo un mensaje con su cabecera de
+  rango y N citas expandibles independientes, una por bloque) y el cierre de tesis y
+  conclusiones con el pie. Agrupar reduce el número de mensajes SIN tocar el troceo del
+  map. Si el reduce se desvía del contrato, se degrada al summary escapado y troceado:
+  nunca se falla por formato.
 - SEGURIDAD DEL HTML (lo que antes nos hacía evitar `parse_mode`): TODO texto que venga
   del LLM pasa por `html.escape`; las únicas etiquetas vivas son las que pone el bot
   (`<b>`, `<blockquote expandable>`). Y al trocear un mensaje largo se corta el texto
@@ -32,8 +33,10 @@ Todos los textos de cara al usuario van en español.
 
 import html
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -101,6 +104,20 @@ CONCLUSIONS_HEADING = "Tesis y conclusiones"
 
 _QUOTE_OPEN = "<blockquote expandable>"
 _QUOTE_CLOSE = "</blockquote>"
+
+# Emojis SOLO en las cabeceras de sección (nada de emojis en el cuerpo ni por viñeta).
+_PANORAMA_EMOJI = "🗺"
+_CONCLUSIONS_EMOJI = "🎯"
+
+# Marca de tiempo al principio del encabezado de un bloque: `[mm:ss]` o `[hh:mm:ss]`.
+_TIMESTAMP_RE = re.compile(r"^\[(?P<ts>\d{1,2}:\d{2}(?::\d{2})?)\]\s*(?P<topic>.*)$")
+
+# Separadores de la agrupación (los pone el bot, así que no se escapan). El divisor entre
+# bloques es una línea tenue, discreta: ni emojis ni marcos.
+_GROUP_HEADER_SEP = "\n\n"
+_BLOCK_DIVIDER = "\n\n──────────\n\n"
+# Guion largo (en dash) para los rangos: "Bloques 1–4", "[00:00–10:00]".
+_RANGE_DASH = "–"
 
 
 # --------------------------------------------------------------------------------------
@@ -298,13 +315,121 @@ def build_block_message(heading: str, body: str, limit: int = TELEGRAM_MAX_CHARS
     return _section_messages(heading, body, quoted=True, limit=limit, render=_escape)
 
 
+class _RangedBlock(NamedTuple):
+    """Un bloque con su título ya convertido a rango y sus mm:ss de inicio/fin."""
+
+    title: str  # "[mm:ss–mm:ss] tema" (o el encabezado tal cual si no traía marca)
+    start: str | None  # inicio en mm:ss, o None si el encabezado no era parseable
+    end: str | None  # fin (= inicio del bloque siguiente), o None para el último
+
+
+def _ranged_blocks(headings: list[str]) -> list[_RangedBlock]:
+    """Pasa los encabezados `[mm:ss] tema` a títulos con rango `[mm:ss–mm:ss] tema`.
+
+    El fin de un bloque es el inicio del SIGUIENTE (si es parseable); el último se queda
+    con su inicio a secas. Un encabezado que no case con el patrón se deja tal cual.
+    """
+    parsed = [_TIMESTAMP_RE.match(heading) for heading in headings]
+    result: list[_RangedBlock] = []
+    for index, heading in enumerate(headings):
+        match = parsed[index]
+        if match is None:
+            result.append(_RangedBlock(heading, None, None))
+            continue
+        start, topic = match.group("ts"), match.group("topic")
+        following = parsed[index + 1] if index + 1 < len(parsed) else None
+        end = following.group("ts") if following is not None else None
+        span = f"{start}{_RANGE_DASH}{end}" if end else start
+        result.append(_RangedBlock(f"[{span}] {topic}".rstrip(), start, end))
+    return result
+
+
+def _group_header_text(first_number: int, last_number: int, group: list[_RangedBlock]) -> str:
+    """Cabecera de un grupo: numeración de bloques y, si se puede, el rango temporal.
+
+    Ej.: "Bloques 1–4 · 00:00–40:00". Si ningún bloque del grupo trae marca de tiempo,
+    devuelve solo la numeración: nunca falla por un formato inesperado.
+    """
+    if first_number == last_number:
+        numbering = f"Bloque {first_number}"
+    else:
+        numbering = f"Bloques {first_number}{_RANGE_DASH}{last_number}"
+    starts = [block.start for block in group if block.start]
+    ends = [block.end or block.start for block in group if block.start]
+    if not starts:
+        return numbering
+    span = starts[0] if starts[0] == ends[-1] else f"{starts[0]}{_RANGE_DASH}{ends[-1]}"
+    return f"{numbering} · {span}"
+
+
+def _render_block_unit(title: str, body: str) -> str:
+    """El HTML de un bloque dentro de un grupo: título en negrita + su cita expandible.
+
+    Sin trocear: se usa cuando el bloque cabe en el mensaje. TODO el texto del LLM (título
+    y cuerpo) se escapa; las únicas etiquetas vivas son las que pone el bot.
+    """
+    header = f"<b>{_escape(title)}</b>"
+    if not body:
+        return header
+    return f"{header}\n{_QUOTE_OPEN}{_escape(body)}{_QUOTE_CLOSE}"
+
+
+def build_group_messages(
+    header_text: str, blocks: list[tuple[str, str]], limit: int = TELEGRAM_MAX_CHARS
+) -> list[str]:
+    """Los mensajes HTML de un grupo de bloques: UNA cabecera de grupo + N bloques.
+
+    Cada bloque conserva su PROPIA cita expandible con su título en negrita encima; los
+    bloques se separan con una línea tenue. Si el grupo no cabe en `limit`, se parte por
+    límites de bloque (nunca a mitad de bloque si se puede evitar) en mensajes sucesivos, y
+    solo si un bloque individual no cupiera se aplica el troceo interno de
+    `build_block_message`. El escape y el orden trocear→escapar se mantienen intactos.
+    """
+    header_html = f"<b>{_escape(header_text)}</b>"
+    messages: list[str] = []
+    current = header_html  # el primer mensaje del grupo arranca con la cabecera
+    has_block = False  # ¿lleva `current` ya algún bloque?
+
+    def flush() -> None:
+        nonlocal current, has_block
+        if current:
+            messages.append(current)
+        current = ""
+        has_block = False
+
+    for title, body in blocks:
+        unit = _render_block_unit(title, body)
+        if not current:
+            separator = ""
+        elif has_block:
+            separator = _BLOCK_DIVIDER
+        else:
+            separator = _GROUP_HEADER_SEP
+        if len(current) + len(separator) + len(unit) <= limit:
+            current += separator + unit
+            has_block = True
+            continue
+        # No cabe con lo ya acumulado: cerramos el mensaje en curso por el límite de bloque.
+        flush()
+        if len(unit) <= limit:
+            current = unit
+            has_block = True
+        else:
+            # Ni el bloque solo cabe: se trocea por dentro (cada trozo en su cita).
+            messages.extend(build_block_message(title, body, limit))
+    flush()
+    return messages
+
+
 def build_report_messages(
     result: SummaryResult, settings: Settings, limit: int = TELEGRAM_MAX_CHARS
 ) -> list[str]:
     """Todos los mensajes HTML del informe, en su orden de envío.
 
-    Panorama, un mensaje por bloque y el cierre de tesis y conclusiones (el pie de
-    bloques/tokens/coste va en el último mensaje). Si el reduce no siguió el contrato de
+    Panorama, los bloques AGRUPADOS de `settings.blocks_per_message` en
+    `settings.blocks_per_message` (cada grupo un mensaje: una cabecera de grupo con su
+    rango + N citas expandibles independientes) y el cierre de tesis y conclusiones (el pie
+    de bloques/tokens/coste va en el último mensaje). Si el reduce no siguió el contrato de
     encabezados (ni bloques ni cierre), se degrada al summary completo escapado y
     troceado: nunca se falla por formato.
     """
@@ -318,13 +443,26 @@ def build_report_messages(
     messages: list[str] = []
     if report.panorama:
         messages += _section_messages(
-            f"🧭 {PANORAMA_HEADING}", report.panorama, quoted=False, limit=limit, render=_escape
+            f"{_PANORAMA_EMOJI} {PANORAMA_HEADING}",
+            report.panorama,
+            quoted=False,
+            limit=limit,
+            render=_escape,
         )
-    for heading, body in report.blocks:
-        messages += build_block_message(heading, body, limit)
+
+    ranged = _ranged_blocks([heading for heading, _ in report.blocks])
+    bodies = [body for _, body in report.blocks]
+    per_message = max(1, settings.blocks_per_message)
+    for start in range(0, len(ranged), per_message):
+        group = ranged[start : start + per_message]
+        group_bodies = bodies[start : start + per_message]
+        header_text = _group_header_text(start + 1, start + len(group), group)
+        grouped = [(block.title, body) for block, body in zip(group, group_bodies, strict=True)]
+        messages += build_group_messages(header_text, grouped, limit)
+
     if report.conclusions:
         messages += _section_messages(
-            f"📌 {CONCLUSIONS_HEADING}",
+            f"{_CONCLUSIONS_EMOJI} {CONCLUSIONS_HEADING}",
             report.conclusions + footer,
             quoted=False,
             limit=limit,

@@ -154,9 +154,10 @@ Implementados y cubiertos con tests:
   `blocks: list[BlockSummary]` (`index` cronológico desde 0, `timespan` del Chunk y
   `extraction` tal cual salió del map): material intermedio que ya NO se entrega al
   usuario, pero se conserva en el resultado.
-- `config.py` — completo, incluido `get_settings()` (única instancia, con `lru_cache`) y
-  el control de acceso: `allowed_user_ids` (CSV en el entorno) con la propiedad
-  `allowed_user_id_list` que lo parsea a `list[int]`, igual que `sub_langs`/`sub_lang_list`.
+- `config.py` — completo, incluido `get_settings()` (única instancia, con `lru_cache`), el
+  control de acceso (`allowed_user_ids` CSV -> `allowed_user_id_list: list[int]`, igual que
+  `sub_langs`/`sub_lang_list`) y `blocks_per_message` (bloques agrupados por mensaje, 4 por
+  defecto).
 - `bot.py` — la aplicación de python-telegram-bot en polling y el entry point
   `uv run macrobot` (fase 4). La lógica pura (troceo a 4096, traducción de errores,
   coste estimado, pie del informe, `parse_report` y la construcción de los mensajes
@@ -176,11 +177,22 @@ Decisiones de la capa de Telegram (fase 4):
   ediciones fallidas (rate limit, texto idéntico) se ignoran con log en DEBUG — el
   progreso es cosmético y no debe tumbar un resumen de varios minutos.
 - El informe se envía en `parse_mode=HTML` con CITAS EXPANDIBLES nativas: un mensaje con
-  el Panorama, uno por bloque (`<b>[mm:ss] Tema</b>` + `<blockquote expandable>` con el
-  contenido, que Telegram colapsa solo — sin botones ni callbacks) y el cierre "Tesis y
-  conclusiones" con el pie. `bot.parse_report` parte `result.summary` por el contrato de
-  encabezados del reduce; si el LLM se desvía (ni bloques ni cierre), se degrada al
-  summary escapado y troceado: nunca se falla por formato.
+  el Panorama, los bloques AGRUPADOS y el cierre "Tesis y conclusiones" con el pie.
+  `bot.parse_report` parte `result.summary` por el contrato de encabezados del reduce; si
+  el LLM se desvía (ni bloques ni cierre), se degrada al summary escapado y troceado:
+  nunca se falla por formato.
+- AGRUPACIÓN DE BLOQUES (`build_group_messages`): en vez de un mensaje por bloque —un
+  vídeo de 2 h da ~12 y el chat se hace interminable—, se agrupan `blocks_per_message`
+  (4 por defecto) en un solo mensaje, SIN tocar el troceo del map (que es quien da la
+  calidad). Cada grupo = una cabecera de grupo en negrita con su rango (`<b>Bloques 1–4 ·
+  00:00–40:00</b>`, o `Bloque N` si es uno solo) + N bloques, cada uno con su PROPIA cita
+  expandible y su título en negrita encima, separados por una línea tenue (`──────────`).
+  Si un grupo no cabe en 4096, se parte por límites de bloque en mensajes sucesivos; solo
+  si un bloque individual no cupiera se aplica el troceo interno de `build_block_message`.
+  Los títulos pasan de `[mm:ss]` a RANGO `[mm:ss–mm:ss]` (`_ranged_blocks`): el fin es el
+  inicio del bloque siguiente y el último se queda con su inicio a secas; un encabezado no
+  parseable se deja tal cual. Jerarquía ligera de secciones: emoji SOLO en las cabeceras
+  (`🗺` Panorama, `🎯` cierre), nunca en el cuerpo ni por viñeta.
 - SEGURIDAD DEL HTML (lo que antes nos hacía enviar texto plano): TODO texto que venga
   del LLM pasa por `html.escape`; las únicas etiquetas vivas son las que pone el bot
   (`<b>`, `<blockquote expandable>`). Al trocear, el corte va sobre el texto CRUDO y el
