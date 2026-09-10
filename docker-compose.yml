@@ -1,0 +1,15 @@
+services:
+  bot:
+    build: .
+    # Los secretos (TELEGRAM_TOKEN, OPENROUTER_API_KEY...) se inyectan en runtime desde
+    # .env: NUNCA van en el compose ni horneados en la imagen.
+    env_file: .env
+    # Sobrevive a caídas del proceso y a reinicios del host (bot 24/7).
+    restart: unless-stopped
+    # Sin `ports`: el bot funciona en modo polling y no expone nada.
+    # Rotación de logs para que no llenen el disco de la VM con el tiempo.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

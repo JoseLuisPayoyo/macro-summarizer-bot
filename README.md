@@ -48,6 +48,27 @@ uv run macrobot
 Arranca en modo polling: no hace falta webhook ni URL pública. Abre Telegram, escríbele al
 bot y mándale un enlace de YouTube.
 
+## Despliegue
+
+Para correr el bot 24/7 (por ejemplo en una VM) hay un `Dockerfile` y un
+`docker-compose.yml`. El contenedor lee los secretos de `.env` en runtime (nunca se
+hornean en la imagen) y arranca en modo polling, sin exponer puertos.
+
+```bash
+docker compose up --build        # prueba local: construye y arranca
+docker compose logs -f           # ver los logs (rotados: 3 ficheros de 10 MB)
+docker compose down              # parar
+```
+
+Actualizar tras cambios en el repo:
+
+```bash
+git pull && docker compose up -d --build
+```
+
+El servicio arranca con `restart: unless-stopped`, así que sobrevive a caídas del proceso
+y a reinicios del host. La imagen es multi-arch (funciona en ARM64, p. ej. una VM Ampere).
+
 ## Desarrollo
 
 ```bash

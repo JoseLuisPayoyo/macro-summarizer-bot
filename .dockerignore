@@ -1,0 +1,55 @@
+# Entorno virtual y secretos: NUNCA viajan a la imagen.
+.venv/
+venv/
+.env
+.env.example
+
+# Control de versiones
+.git/
+.gitignore
+
+# Tests: no forman parte de la imagen de producción.
+tests/
+
+# Python (bytecode y artefactos de build)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Cachés de herramientas
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Ficheros temporales del pipeline (audio/subtítulos descargados)
+*.vtt
+*.m4a
+*.webm
+*.mp3
+tmp/
+
+# Editores / SO
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Documentación y meta del repo (innecesarios en runtime).
+# README.md NO se ignora: el backend `uv_build` lo necesita para construir el paquete.
+# Solo entra en el builder; la imagen final no lo copia.
+CLAUDE.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Artefactos locales de Claude Code
+.claude/
+.agents/
+skills-lock.json
