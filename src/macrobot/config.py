@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     reduce_input_usd_per_mtok: float | None = None
     reduce_output_usd_per_mtok: float | None = None
 
+    # --- Control de acceso ---
+    # IDs numéricos de Telegram autorizados, como cadena separada por comas (cada usuario
+    # obtiene el suyo escribiendo a @userinfobot). VACÍO = nadie autorizado: el bot falla
+    # CERRADO (rechaza a todo el mundo), nunca abierto.
+    allowed_user_ids: str = ""
+
     # --- Comportamiento del resumen ---
     summary_lang: str = "es"
     chunk_minutes: int = 10
@@ -49,6 +55,11 @@ class Settings(BaseSettings):
     def sub_lang_list(self) -> list[str]:
         """`sub_langs` como lista de códigos de idioma, en orden de preferencia."""
         return [lang.strip() for lang in self.sub_langs.split(",") if lang.strip()]
+
+    @property
+    def allowed_user_id_list(self) -> list[int]:
+        """`allowed_user_ids` como lista de enteros (IDs de Telegram); vacía = nadie."""
+        return [int(uid.strip()) for uid in self.allowed_user_ids.split(",") if uid.strip()]
 
 
 @lru_cache(maxsize=1)

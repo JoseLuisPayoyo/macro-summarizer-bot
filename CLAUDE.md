@@ -154,7 +154,9 @@ Implementados y cubiertos con tests:
   `blocks: list[BlockSummary]` (`index` cronológico desde 0, `timespan` del Chunk y
   `extraction` tal cual salió del map): material intermedio que ya NO se entrega al
   usuario, pero se conserva en el resultado.
-- `config.py` — completo, incluido `get_settings()` (única instancia, con `lru_cache`).
+- `config.py` — completo, incluido `get_settings()` (única instancia, con `lru_cache`) y
+  el control de acceso: `allowed_user_ids` (CSV en el entorno) con la propiedad
+  `allowed_user_id_list` que lo parsea a `list[int]`, igual que `sub_langs`/`sub_lang_list`.
 - `bot.py` — la aplicación de python-telegram-bot en polling y el entry point
   `uv run macrobot` (fase 4). La lógica pura (troceo a 4096, traducción de errores,
   coste estimado, pie del informe, `parse_report` y la construcción de los mensajes
@@ -195,6 +197,17 @@ Decisiones de la capa de Telegram (fase 4):
 - La salida de cada map empieza con el rango temporal del bloque (lo exige `MAP_SYSTEM` y
   lo inyecta `build_map_user_prompt`): así el reduce recibe las marcas de tiempo sin
   cableado extra, y de ahí salen los encabezados `## [mm:ss] tema` del informe.
+- CONTROL DE ACCESO POR LISTA BLANCA (el bot se despliega 24/7 y su @usuario es
+  descubrible): solo los IDs de `allowed_user_id_list` pueden usarlo. Se aplica con el
+  sistema de filtros de python-telegram-bot, no comprobando dentro de la lógica de
+  negocio: `access_filter(settings)` es un `filters.User(user_id=...)` que se combina con
+  los handlers de `/start` y de texto, y un handler de respaldo con `~access_filter`
+  atiende a los no autorizados con `PRIVATE_BOT_MESSAGE` (va el ÚLTIMO, para que los
+  autorizados ganen). FALLA CERRADO: la lista vacía no casa con nadie, así que todos caen
+  en el respaldo; `main` lo avisa por log al arrancar. Cada rechazo se loguea a INFO con
+  el user id y el username. Los handlers siguen sin cobertura unitaria, pero el filtro, el
+  enrutado (autorizado -> `handle_message`; no autorizado -> `reject_unauthorized`) y el
+  mensaje de rechazo sí están cubiertos.
 
 ## Cómo se prueba
 

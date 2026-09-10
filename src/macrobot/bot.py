@@ -69,6 +69,8 @@ NO_URL_MESSAGE = (
     "(youtube.com/watch?v=… o youtu.be/…) y me pongo con ello."
 )
 
+PRIVATE_BOT_MESSAGE = "🔒 Este bot es privado y no está disponible para tu usuario."
+
 INITIAL_STATUS_MESSAGE = "🎬 Enlace recibido, empiezo a procesar el vídeo…"
 
 DONE_MESSAGE = "✅ Listo. Aquí va el informe:"
@@ -341,6 +343,29 @@ def build_report_messages(
 # --------------------------------------------------------------------------------------
 
 
+def access_filter(settings: Settings) -> filters.BaseFilter:
+    """Filtro que solo deja pasar a los usuarios de `allowed_user_id_list`.
+
+    Con la lista vacía, `filters.User` no casa con nadie: el bot falla CERRADO y todos los
+    mensajes caen en el handler de rechazo. Es la pieza que evita duplicar la comprobación
+    dentro de la lógica de negocio: los handlers autorizados ni se disparan para un extraño.
+    """
+    return filters.User(user_id=settings.allowed_user_id_list)
+
+
+async def reject_unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Atiende a los usuarios no autorizados: avisa de que el bot es privado y los loguea."""
+    user = update.effective_user
+    logger.info(
+        "Acceso rechazado: user_id=%s username=%s",
+        user.id if user else "?",
+        user.username if user else "?",
+    )
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(PRIVATE_BOT_MESSAGE)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handler de `/start`: envía el mensaje de bienvenida."""
     message = update.effective_message
@@ -410,8 +435,14 @@ def build_application(settings: Settings, client: OpenRouterClient) -> Applicati
     )
     application.bot_data["settings"] = settings
     application.bot_data["client"] = client
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    allowed = access_filter(settings)
+    application.add_handler(CommandHandler("start", start, filters=allowed))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & allowed, handle_message)
+    )
+    # Respaldo: cualquier update de un usuario NO autorizado cae aquí (fallar cerrado). Va
+    # el último para que los handlers autorizados ganen a los remitentes permitidos.
+    application.add_handler(MessageHandler(~allowed, reject_unauthorized))
     return application
 
 
@@ -424,6 +455,14 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)  # una línea por petición es ruido
 
     settings = get_settings()
+    if not settings.allowed_user_id_list:
+        logger.warning(
+            "ALLOWED_USER_IDS está vacío: el bot rechazará a TODOS los usuarios (fallo "
+            "cerrado). Añade tu ID de Telegram (te lo da @userinfobot) para poder usarlo."
+        )
+    else:
+        logger.info("Usuarios autorizados: %s", settings.allowed_user_id_list)
+
     client = OpenRouterClient(settings, title="macrobot")
     application = build_application(settings, client)
 

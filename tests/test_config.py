@@ -23,6 +23,21 @@ def test_sub_lang_list_strips_spaces_and_ignores_empty_entries():
     assert settings.sub_lang_list == ["en", "es", "en-US"]
 
 
+def test_allowed_user_id_list_parses_the_csv_into_ints():
+    settings = make_settings(allowed_user_ids="123, 456 ,789")
+
+    assert settings.allowed_user_id_list == [123, 456, 789]
+
+
+def test_allowed_user_id_list_is_empty_by_default_failing_closed():
+    # Vacío = nadie autorizado: el bot debe fallar cerrado, no abrir a todo el mundo.
+    assert make_settings().allowed_user_id_list == []
+
+
+def test_allowed_user_id_list_ignores_blank_entries():
+    assert make_settings(allowed_user_ids=" , ,42, ").allowed_user_id_list == [42]
+
+
 def test_max_concurrency_defaults_to_five():
     assert make_settings().max_concurrency == 5
 

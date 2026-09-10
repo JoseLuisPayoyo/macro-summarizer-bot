@@ -10,21 +10,28 @@ etiquetas vivas son las que pone el bot). La integración con python-telegram-bo
 
 import html
 import re
+from datetime import UTC, datetime
 
 import pytest
+from telegram import Chat, Message, Update, User
 
 from macrobot.bot import (
     LLM_ERROR_MESSAGE,
     NO_SUBTITLES_MESSAGE,
+    PRIVATE_BOT_MESSAGE,
     TELEGRAM_MAX_CHARS,
     UNEXPECTED_ERROR_MESSAGE,
     VIDEO_ERROR_MESSAGE,
+    access_filter,
+    build_application,
     build_block_message,
     build_footer,
     build_report_messages,
     error_message,
     estimate_cost,
+    handle_message,
     parse_report,
+    reject_unauthorized,
     split_message,
 )
 from macrobot.config import Settings
@@ -386,3 +393,92 @@ def test_the_footer_includes_the_estimated_cost_when_prices_are_configured():
     footer = build_footer(make_result(), make_settings(**PRICES))
 
     assert "0,073 $" in footer
+
+
+# --------------------------------------------------------------------------------------
+# Control de acceso por lista blanca
+# --------------------------------------------------------------------------------------
+
+
+def make_update(user_id: int, *, username: str = "usuario", text: str = "hola") -> Update:
+    """Un Update de Telegram mínimo con un mensaje de texto de `user_id` (sin bot ni red)."""
+    user = User(id=user_id, first_name="Test", is_bot=False, username=username)
+    chat = Chat(id=user_id, type=Chat.PRIVATE)
+    message = Message(message_id=1, date=datetime.now(UTC), chat=chat, from_user=user, text=text)
+    return Update(update_id=1, message=message)
+
+
+class RecordingMessage:
+    """Un mensaje de Telegram de pega que solo captura los `reply_text` que recibe."""
+
+    def __init__(self) -> None:
+        self.replies: list[str] = []
+
+    async def reply_text(self, text: str, **_: object) -> None:
+        self.replies.append(text)
+
+
+class UpdateStub:
+    """Update mínimo para invocar `reject_unauthorized` sin construir objetos de Telegram."""
+
+    def __init__(self, user_id: int, username: str, message: RecordingMessage) -> None:
+        self.effective_user = User(id=user_id, first_name="T", is_bot=False, username=username)
+        self.effective_message = message
+
+
+def test_access_filter_lets_an_allowed_user_through():
+    allowed = access_filter(make_settings(allowed_user_ids="123,456"))
+
+    assert allowed.check_update(make_update(123))
+
+
+def test_access_filter_blocks_a_user_not_in_the_list():
+    allowed = access_filter(make_settings(allowed_user_ids="123,456"))
+
+    assert not allowed.check_update(make_update(999))
+
+
+def test_access_filter_with_an_empty_list_blocks_everyone():
+    # Lista vacía = fallar cerrado: nadie pasa el filtro (ni siquiera un id cualquiera).
+    allowed = access_filter(make_settings(allowed_user_ids=""))
+
+    assert not allowed.check_update(make_update(123))
+    assert not allowed.check_update(make_update(999))
+
+
+def routed_callback(settings: Settings, update: Update):
+    """Devuelve el callback del primer handler que atendería `update`, como en runtime."""
+    application = build_application(settings, client=object())
+    for handler in application.handlers[0]:
+        if handler.check_update(update):
+            return handler.callback
+    return None
+
+
+def test_an_allowed_user_reaches_the_pipeline_handler():
+    callback = routed_callback(make_settings(allowed_user_ids="123"), make_update(123))
+
+    assert callback is handle_message
+
+
+def test_an_unauthorized_user_is_routed_to_the_reject_handler_not_the_pipeline():
+    # No se dispara handle_message: el pipeline no llega a invocarse para un extraño.
+    callback = routed_callback(make_settings(allowed_user_ids="123"), make_update(999))
+
+    assert callback is reject_unauthorized
+    assert callback is not handle_message
+
+
+def test_an_empty_list_routes_everyone_to_the_reject_handler():
+    callback = routed_callback(make_settings(allowed_user_ids=""), make_update(123))
+
+    assert callback is reject_unauthorized
+
+
+async def test_reject_unauthorized_sends_the_private_message():
+    message = RecordingMessage()
+    update = UpdateStub(user_id=999, username="intruso", message=message)
+
+    await reject_unauthorized(update, context=None)
+
+    assert message.replies == [PRIVATE_BOT_MESSAGE]
